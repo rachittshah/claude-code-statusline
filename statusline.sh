@@ -1,39 +1,11 @@
 #!/bin/bash
 # ============================================================================
-# Claude Code Enhanced Status Line with Usage Tracking
+# Claude Code Enhanced Status Line with Auto-Detection
 # ============================================================================
-#
-# Shows: Directory | Model | Context Bar | Git Status | 5hr Usage + Cost
-#
-# INSTALLATION:
-#   1. Save this file to ~/.claude/statusline.sh
-#   2. chmod +x ~/.claude/statusline.sh
-#   3. Add to ~/.claude/settings.json:
-#      {
-#        "statusLine": {
-#          "type": "command",
-#          "command": "~/.claude/statusline.sh"
-#        }
-#      }
-#
-# REQUIREMENTS:
-#   - jq (brew install jq)
-#   - bun (curl -fsSL https://bun.sh/install | bash) - for ccusage
-#   - ccusage runs via: bunx ccusage@latest (auto-installed on first run)
-#
-# CONFIGURATION:
-#   Set your Max plan limit (cost per 5hr block):
-#   - Max 5x:  export CLAUDE_BLOCK_LIMIT=35
-#   - Max 20x: export CLAUDE_BLOCK_LIMIT=140
-#   - Pro:     export CLAUDE_BLOCK_LIMIT=10
-#
-# OUTPUT EXAMPLE:
-#   myproject | Claude Opus 4.5 | ctx:████░░░░░░░░ 35% | main 3f +45 -12 | ██████░░ 67% $23.50 (2h15m @$1.58/h)
-#
-# GIST: https://gist.github.com/your-username/your-gist-id
+# Shows: Directory | Model | Context Bar | Git | Usage Bar (auto-detected plan)
 # ============================================================================
 
-# Read JSON input from Claude Code (piped via stdin)
+# Read JSON input from Claude Code
 input=$(cat)
 
 # === COLORS ===
@@ -45,12 +17,7 @@ CYAN='\033[0;36m'
 GRAY='\033[0;90m'
 NC='\033[0m'
 
-# === CONFIG ===
-# Max plan cost limit per 5hr block - adjust based on your plan
-MAX_COST_PER_BLOCK=${CLAUDE_BLOCK_LIMIT:-35}
-
-# === HELPER FUNCTIONS ===
-
+# === HELPERS ===
 build_bar() {
     local percent=$1
     local width=${2:-10}
@@ -72,14 +39,13 @@ get_color() {
     fi
 }
 
-# === PARSE CLAUDE CODE JSON INPUT ===
-
+# === PARSE CLAUDE CODE JSON ===
 model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 current_dir=$(echo "$input" | jq -r '.workspace.current_dir // empty')
 context_size=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
 current_usage=$(echo "$input" | jq '.context_window.current_usage')
 
-# Calculate context window percentage
+# Context percentage
 if [ "$current_usage" != "null" ]; then
     current_tokens=$(echo "$current_usage" | jq '.input_tokens + .cache_creation_input_tokens + .cache_read_input_tokens')
     context_percent=$((current_tokens * 100 / context_size))
@@ -87,92 +53,72 @@ else
     context_percent=0
 fi
 
-# Build context bar
-context_bar=$(build_bar $context_percent 12)
+context_bar=$(build_bar $context_percent 10)
 context_color=$(get_color $context_percent)
-
-# Get directory name
 dir_name=$(basename "$current_dir" 2>/dev/null || echo "~")
 
 # === GIT STATUS ===
-
 git_info=""
 if [ -n "$current_dir" ]; then
     cd "$current_dir" 2>/dev/null || cd /
     if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        branch=$(git branch --show-current 2>/dev/null || echo "detached")
+        branch=$(git branch --show-current 2>/dev/null || echo "HEAD")
         status_output=$(git status --porcelain 2>/dev/null)
-
         if [ -n "$status_output" ]; then
             total_files=$(echo "$status_output" | wc -l | xargs)
-            line_stats=$(git diff --numstat HEAD 2>/dev/null | awk '{added+=$1; removed+=$2} END {print added+0, removed+0}')
-            added=$(echo $line_stats | cut -d' ' -f1)
-            removed=$(echo $line_stats | cut -d' ' -f2)
-
-            git_info="${YELLOW}${branch}${NC} ${GRAY}${total_files}f${NC}"
-            [ "$added" -gt 0 ] && git_info+=" ${GREEN}+${added}${NC}"
-            [ "$removed" -gt 0 ] && git_info+=" ${RED}-${removed}${NC}"
+            git_info="${YELLOW}${branch}${NC}${GRAY}*${total_files}${NC}"
         else
             git_info="${YELLOW}${branch}${NC}"
         fi
     fi
 fi
 
-# === 5-HOUR BLOCK USAGE (via ccusage) ===
-# ccusage analyzes local ~/.claude/projects/ files to calculate usage
-# It tracks tokens/cost within the 5-hour billing windows
-
+# === USAGE DETECTION (auto-detect plan, use all 3 methods) ===
 usage_info=""
+detector_output=$("$HOME/.claude/usage-detector.sh" json 2>/dev/null)
 
-# Try bun first, fall back to npx
-if command -v bun &>/dev/null; then
-    CCUSAGE_CMD="bun x ccusage@latest"
-elif [ -x "$HOME/.bun/bin/bun" ]; then
-    CCUSAGE_CMD="$HOME/.bun/bin/bun x ccusage@latest"
-elif command -v npx &>/dev/null; then
-    CCUSAGE_CMD="npx ccusage@latest"
-else
-    CCUSAGE_CMD=""
-fi
+if echo "$detector_output" | jq -e '.plan' >/dev/null 2>&1; then
+    plan=$(echo "$detector_output" | jq -r '.plan')
+    best_percent=$(echo "$detector_output" | jq -r '.usage.best_percent')
+    best_method=$(echo "$detector_output" | jq -r '.usage.best_method')
+    cost=$(echo "$detector_output" | jq -r '.cost.current')
+    remaining_mins=$(echo "$detector_output" | jq -r '.time.remaining_mins')
+    burn_rate=$(echo "$detector_output" | jq -r '.cost.burn_rate')
+    prompt_count=$(echo "$detector_output" | jq -r '.prompts.estimated')
+    prompt_limit=$(echo "$detector_output" | jq -r '.prompts.limit_max')
 
-if [ -n "$CCUSAGE_CMD" ]; then
-    block_json=$($CCUSAGE_CMD blocks --active --json 2>/dev/null)
+    # Build usage bar
+    usage_bar=$(build_bar $best_percent 8)
+    usage_color=$(get_color $best_percent)
+    cost_fmt=$(printf "%.1f" "$cost" 2>/dev/null || echo "$cost")
 
-    if echo "$block_json" | jq -e '.blocks[0]' >/dev/null 2>&1; then
-        cost=$(echo "$block_json" | jq -r '.blocks[0].costUSD // 0')
-        remaining_mins=$(echo "$block_json" | jq -r '.blocks[0].projection.remainingMinutes // 0')
-        burn_rate=$(echo "$block_json" | jq -r '.blocks[0].burnRate.costPerHour // 0')
-
-        # Calculate usage percentage based on cost limit
-        cost_int=$(printf "%.0f" "$cost")
-        usage_percent=$((cost_int * 100 / MAX_COST_PER_BLOCK))
-        [ "$usage_percent" -gt 100 ] && usage_percent=100
-
-        # Build visual elements
-        usage_bar=$(build_bar $usage_percent 8)
-        usage_color=$(get_color $usage_percent)
-        cost_fmt=$(printf "%.2f" "$cost")
-        burn_fmt=$(printf "%.1f" "$burn_rate")
-
-        # Format time remaining
-        if [ "$remaining_mins" -le 0 ]; then
-            time_left="now"
-        elif [ "$remaining_mins" -lt 60 ]; then
-            time_left="${remaining_mins}m"
-        else
-            time_left="$((remaining_mins / 60))h$((remaining_mins % 60))m"
-        fi
-
-        usage_info="${usage_color}${usage_bar}${NC} ${usage_percent}% ${CYAN}\$${cost_fmt}${NC} ${GRAY}(${time_left} @\$${burn_fmt}/h)${NC}"
+    # Format time
+    if [ "$remaining_mins" -le 0 ] 2>/dev/null; then
+        time_left="reset"
+    elif [ "$remaining_mins" -lt 60 ] 2>/dev/null; then
+        time_left="${remaining_mins}m"
+    else
+        time_left="$((remaining_mins / 60))h$((remaining_mins % 60))m"
     fi
+
+    # Plan badge
+    case "$plan" in
+        max20) plan_badge="20x" ;;
+        max5)  plan_badge="5x" ;;
+        pro)   plan_badge="Pro" ;;
+        *)     plan_badge="" ;;
+    esac
+
+    # Usage info: [████████░░] 87% 5x | $12 ⏱3h
+    usage_info="${usage_color}${usage_bar}${NC} ${best_percent}%"
+    [ -n "$plan_badge" ] && usage_info+=" ${GRAY}${plan_badge}${NC}"
+    usage_info+=" ${GRAY}|${NC} ${CYAN}\$${cost_fmt}${NC} ${GRAY}⏱${time_left}${NC}"
 fi
 
-# === BUILD FINAL OUTPUT ===
-
+# === BUILD OUTPUT ===
 output="${BLUE}${dir_name}${NC}"
 output+=" ${GRAY}|${NC} ${CYAN}${model_name}${NC}"
-output+=" ${GRAY}|${NC} ${GRAY}ctx:${NC}${context_color}${context_bar}${NC} ${context_percent}%"
-
+output+=" ${GRAY}|${NC} ${context_color}${context_bar}${NC} ${context_percent}%"
 [ -n "$git_info" ] && output+=" ${GRAY}|${NC} ${git_info}"
 [ -n "$usage_info" ] && output+=" ${GRAY}|${NC} ${usage_info}"
 

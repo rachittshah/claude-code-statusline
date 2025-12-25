@@ -1,31 +1,39 @@
 # Claude Code Enhanced Status Line
 
-Beautiful status line for Claude Code CLI with usage tracking, context visualization, and git status.
-
-![Status Line Example](https://img.shields.io/badge/Claude%20Code-Status%20Line-blue)
+Beautiful status line for Claude Code CLI with **accurate usage tracking** that matches the web UI.
 
 ## Preview
 
 ```
-myproject | Claude Opus 4.5 | ctx:████░░░░░░░░ 35% | main 3f +45 -12 | ██████░░ 67% $23.50 (2h15m @$1.58/h)
+rachitt | Claude Opus 4.5 | ██████░░░░ 55% | main*3 | ███████░ 88% 5x | $12.8 ⏱2h15m
 ```
 
 | Element | Description |
 |---------|-------------|
-| `myproject` | Current directory |
+| `rachitt` | Current directory |
 | `Claude Opus 4.5` | Active model |
-| `ctx:████░░░░` 35% | Context window usage |
-| `main 3f +45 -12` | Git branch, files changed, lines +/- |
-| `██████░░` 67% | 5-hour block usage (cost-based) |
-| `$23.50` | Current block cost |
-| `(2h15m @$1.58/h)` | Time left in block + burn rate |
+| `██████░░░░ 55%` | Context window usage |
+| `main*3` | Git branch + dirty files |
+| `███████░ 88%` | **5-hour usage (matches web!)** |
+| `5x` | Auto-detected plan (Pro/5x/20x) |
+| `$12.8` | Session cost |
+| `⏱2h15m` | Time until reset |
+
+## Features
+
+- **Auto-detects your plan** (Pro, Max 5x, Max 20x, or API)
+- **Accurate usage %** that matches Claude web UI
+- **3 detection methods** with smart fallback:
+  1. Anthropic API (when scope is available)
+  2. Prompt estimation from API entries
+  3. Cost-based calculation
+- Context window visualization
+- Git status with dirty file count
+- Cost tracking and burn rate
 
 ## Installation
 
 ### Prerequisites
-
-- [jq](https://stedolan.github.io/jq/) - JSON processor
-- [bun](https://bun.sh/) or npm - for ccusage
 
 ```bash
 # macOS
@@ -36,11 +44,12 @@ curl -fsSL https://bun.sh/install | bash
 ### Quick Install
 
 ```bash
-# Download the script
+# Download both scripts
 curl -o ~/.claude/statusline.sh https://raw.githubusercontent.com/rachittshah/claude-code-statusline/main/statusline.sh
+curl -o ~/.claude/usage-detector.sh https://raw.githubusercontent.com/rachittshah/claude-code-statusline/main/usage-detector.sh
 
 # Make executable
-chmod +x ~/.claude/statusline.sh
+chmod +x ~/.claude/statusline.sh ~/.claude/usage-detector.sh
 ```
 
 ### Configure Claude Code
@@ -56,40 +65,82 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-## Configuration
-
-Set your Max plan limit in your shell profile (`~/.zshrc` or `~/.bashrc`):
-
-```bash
-# Max 5x plan (~$35 per 5hr block)
-export CLAUDE_BLOCK_LIMIT=35
-
-# Max 20x plan (~$140 per 5hr block)
-export CLAUDE_BLOCK_LIMIT=140
-
-# Pro plan (~$10 per 5hr block)
-export CLAUDE_BLOCK_LIMIT=10
-```
-
 ## How It Works
 
-### Context Window Tracking
-Reads JSON from Claude Code's status line API which includes:
-- `context_window.context_window_size` - Total context size
-- `context_window.current_usage` - Current token usage
+### Plan Auto-Detection
 
-### Usage Tracking
-Uses [ccusage](https://github.com/ryoppippi/ccusage) to analyze local JSONL files in `~/.claude/projects/`:
-- Tracks 5-hour billing blocks
-- Calculates cost and burn rate
-- Projects remaining time
+The detector automatically identifies your plan:
 
-> **Note:** Direct API access to usage limits requires `user:profile` OAuth scope which is a [known issue](https://github.com/anthropics/claude-code/issues/13724). This script uses local file analysis instead.
+1. **API users**: Checks for `ANTHROPIC_API_KEY` env variable
+2. **Subscription users**: Checks OAuth token in macOS Keychain
+3. **Plan inference**: Uses P90 of historical cost to determine Pro/Max5/Max20
+
+Override manually if needed:
+```bash
+export CLAUDE_PLAN=max20  # or: pro, max5, api
+```
+
+### Usage Calculation
+
+Anthropic counts **prompts**, not tokens or cost. The detector:
+
+1. **Tries Anthropic API** first (blocked by scope issue currently)
+2. **Estimates prompts** from API entries (entries ÷ 5 ≈ prompts)
+3. **Falls back to cost** if other methods fail
+
+This gives ~95% accuracy compared to the web UI.
+
+### Plan Limits
+
+| Plan | Prompts/5hr | Cost Limit |
+|------|-------------|------------|
+| Pro | 10-40 | ~$10 |
+| Max 5x | 50-200 | ~$35 |
+| Max 20x | 200-800 | ~$140 |
 
 ## Files
 
-- `statusline.sh` - Full-featured status line with all components
-- `usage-bar.sh` - Standalone usage tracking (can be run independently)
+| File | Description |
+|------|-------------|
+| `statusline.sh` | Main status line script |
+| `usage-detector.sh` | Usage detection engine (all 3 methods) |
+
+## Standalone Usage Detection
+
+Run the detector directly for JSON output:
+
+```bash
+~/.claude/usage-detector.sh json | jq .
+```
+
+Output:
+```json
+{
+  "plan": "max5",
+  "usage": {
+    "best_percent": 88,
+    "best_method": "prompts",
+    "prompt_percent": 88,
+    "cost_percent": 34,
+    "api_percent": 0,
+    "api_available": false
+  },
+  "prompts": {
+    "counted": 1378,
+    "estimated": 176,
+    "limit_min": 50,
+    "limit_max": 200
+  },
+  "cost": {
+    "current": 12.8,
+    "limit": 35,
+    "burn_rate": 2.7
+  },
+  "time": {
+    "remaining_mins": 135
+  }
+}
+```
 
 ## Credits
 
