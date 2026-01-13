@@ -66,7 +66,7 @@ if [ -n "$current_dir" ]; then
         status_output=$(git status --porcelain 2>/dev/null)
         if [ -n "$status_output" ]; then
             total_files=$(echo "$status_output" | wc -l | xargs)
-            git_info="${YELLOW}${branch}${NC}${GRAY}*${total_files}${NC}"
+            git_info="${YELLOW}${branch}${NC} ${GRAY}*${total_files}${NC}"
         else
             git_info="${YELLOW}${branch}${NC}"
         fi
@@ -116,10 +116,11 @@ if echo "$detector_output" | jq -e '.plan' >/dev/null 2>&1; then
 fi
 
 # === BUILD OUTPUT ===
+SEP=" ${GRAY}│${NC} "
 output="${BLUE}${dir_name}${NC}"
-output+=" ${GRAY}|${NC} ${CYAN}${model_name}${NC}"
-output+=" ${GRAY}|${NC} ${context_color}${context_bar}${NC} ${context_percent}%"
-[ -n "$git_info" ] && output+=" ${GRAY}|${NC} ${git_info}"
-[ -n "$usage_info" ] && output+=" ${GRAY}|${NC} ${usage_info}"
+output+="${SEP}${CYAN}${model_name}${NC}"
+output+="${SEP}${context_color}${context_bar}${NC} ${context_percent}%"
+[ -n "$git_info" ] && output+="${SEP}${git_info}"
+[ -n "$usage_info" ] && output+="${SEP}${usage_info}"
 
 echo -e "$output"
