@@ -1,58 +1,59 @@
-# Claude Code Enhanced Status Line
+# Claude Code Status Line v2
 
-Beautiful status line for Claude Code CLI with **accurate usage tracking** that matches the web UI.
+Rich status line for Claude Code CLI — shows model, vim mode, agent, context, git, lines changed, cost, duration, and usage tracking.
 
 ## Preview
 
 ```
-rachitt | Claude Opus 4.5 | ██████░░░░ 55% | main*3 | ███████░ 88% 5x | $12.8 ⏱2h15m
+astroscore │ Opus │ N │ security-reviewer │ ██████░░░░ 55% │ main*3 │ +156-23 │ $0.01 │ 45s │ ███████░ 88% 5x │ r:2h15m
 ```
 
-| Element | Description |
-|---------|-------------|
-| `rachitt` | Current directory |
-| `Claude Opus 4.5` | Active model |
-| `██████░░░░ 55%` | Context window usage |
-| `main*3` | Git branch + dirty files |
-| `███████░ 88%` | **5-hour usage (matches web!)** |
-| `5x` | Auto-detected plan (Pro/5x/20x) |
-| `$12.8` | Session cost |
-| `⏱2h15m` | Time until reset |
+| Segment | Source Field | Description |
+|---------|-------------|-------------|
+| `astroscore` | `workspace.current_dir` | Current directory (basename) |
+| `Opus` | `model.display_name` | Active model |
+| `N` | `vim.mode` | Vim mode (N/I/V/R) |
+| `security-reviewer` | `agent.name` | Active agent name |
+| `██████░░░░ 55%` | `context_window.used_percentage` | Context window usage |
+| `!` | `exceeds_200k_tokens` | Context overflow warning |
+| `main*3` | git status | Branch + dirty file count |
+| `+156-23` | `cost.total_lines_added/removed` | Lines changed this session |
+| `$0.01` | `cost.total_cost_usd` | Session cost |
+| `45s` | `cost.total_duration_ms` | Session duration |
+| `███████░ 88% 5x` | usage-detector | 5-hour usage % + plan badge |
+| `r:2h15m` | usage-detector | Time until limit reset |
 
-## Features
-
-- **Auto-detects your plan** (Pro, Max 5x, Max 20x, or API)
-- **Accurate usage %** that matches Claude web UI
-- **3 detection methods** with smart fallback:
-  1. Anthropic API (when scope is available)
-  2. Prompt estimation from API entries
-  3. Cost-based calculation
-- Context window visualization
-- Git status with dirty file count
-- Cost tracking and burn rate
+Segments are hidden when their data is empty (no vim mode = no vim segment, etc.).
 
 ## Installation
 
 ### Prerequisites
 
-```bash
-# macOS
-brew install jq
-curl -fsSL https://bun.sh/install | bash
-```
+- `jq` (required)
+- `bun` (optional, for usage tracking via [ccusage](https://github.com/ryoppippi/ccusage))
 
 ### Quick Install
 
 ```bash
-# Download both scripts
-curl -o ~/.claude/statusline.sh https://raw.githubusercontent.com/rachittshah/claude-code-statusline/main/statusline.sh
-curl -o ~/.claude/usage-detector.sh https://raw.githubusercontent.com/rachittshah/claude-code-statusline/main/usage-detector.sh
-
-# Make executable
-chmod +x ~/.claude/statusline.sh ~/.claude/usage-detector.sh
+git clone https://github.com/rachittshah/claude-code-statusline.git
+cd claude-code-statusline
+bash install.sh
 ```
 
-### Configure Claude Code
+### Manual Install
+
+```bash
+# macOS
+brew install jq
+
+# Linux (Debian/Ubuntu)
+sudo apt-get install -y jq
+
+# Copy scripts
+mkdir -p ~/.claude/statusline
+cp statusline.sh usage-detector.sh usage-bar.sh ~/.claude/statusline/
+chmod +x ~/.claude/statusline/*.sh
+```
 
 Add to `~/.claude/settings.json`:
 
@@ -60,92 +61,107 @@ Add to `~/.claude/settings.json`:
 {
   "statusLine": {
     "type": "command",
-    "command": "~/.claude/statusline.sh"
+    "command": "$HOME/.claude/statusline/statusline.sh"
   }
 }
 ```
 
-## How It Works
+## Features
+
+- **Native JSON fields** — Uses `cost.total_cost_usd`, `context_window.used_percentage`, `vim.mode`, `agent.name`, etc.
+- **Single jq call** — All fields extracted in one pass (4x faster than v1)
+- **Cross-platform** — Works on macOS and Linux
+- **Backward compatible** — Falls back to token-based context calculation when `used_percentage` is unavailable
+- **Auto-detects plan** — Pro, Max 5x, Max 20x, or API (via credential metadata)
+- **3 usage detection methods** — Anthropic API, prompt estimation, cost-based
+- **Context overflow warning** — Shows `!` when `exceeds_200k_tokens` is true
+
+## JSON Schema Reference
+
+<details>
+<summary>Full input JSON schema (click to expand)</summary>
+
+```json
+{
+  "hook_event_name": "Status",
+  "model": {
+    "display_name": "Opus"
+  },
+  "workspace": {
+    "current_dir": "/home/user/project"
+  },
+  "context_window": {
+    "used_percentage": 55,
+    "context_window_size": 200000,
+    "current_usage": {
+      "input_tokens": 50000,
+      "cache_creation_input_tokens": 10000,
+      "cache_read_input_tokens": 5000
+    }
+  },
+  "cost": {
+    "total_cost_usd": 0.01234,
+    "total_duration_ms": 45000,
+    "total_lines_added": 156,
+    "total_lines_removed": 23
+  },
+  "exceeds_200k_tokens": false,
+  "vim": {
+    "mode": "NORMAL"
+  },
+  "agent": {
+    "name": "security-reviewer"
+  }
+}
+```
+
+</details>
+
+## Usage Tracking
 
 ### Plan Auto-Detection
 
-The detector automatically identifies your plan:
+The detector identifies your plan from credential metadata:
 
-1. **API users**: Checks for `ANTHROPIC_API_KEY` env variable
-2. **Subscription users**: Checks OAuth token in macOS Keychain
-3. **Plan inference**: Uses P90 of historical cost to determine Pro/Max5/Max20
+1. **API key**: `ANTHROPIC_API_KEY` set — API mode (no usage tracking)
+2. **Credential metadata**: Reads `subscriptionType`/`rateLimitTier` from:
+   - macOS: Keychain (`Claude Code-credentials`)
+   - Linux: `~/.claude/.credentials.json`
+3. **Cost inference**: Falls back to historical cost (via ccusage)
 
-Override manually if needed:
+Override manually:
+
 ```bash
-export CLAUDE_PLAN=max20  # or: pro, max5, api
+export CLAUDE_PLAN=max20  # pro, max5, max20, api
 ```
-
-### Usage Calculation
-
-Anthropic counts **prompts**, not tokens or cost. The detector:
-
-1. **Tries Anthropic API** first (blocked by scope issue currently)
-2. **Estimates prompts** from API entries (entries ÷ 5 ≈ prompts)
-3. **Falls back to cost** if other methods fail
-
-This gives ~95% accuracy compared to the web UI.
 
 ### Plan Limits
 
 | Plan | Prompts/5hr | Cost Limit |
 |------|-------------|------------|
 | Pro | 10-40 | ~$10 |
-| Max 5x | 50-200 | ~$35 |
-| Max 20x | 200-800 | ~$140 |
+| Max 5x | 50-200 | ~$50 |
+| Max 20x | 200-800 | ~$200 |
+
+### Standalone Usage
+
+```bash
+~/.claude/statusline/usage-detector.sh json | jq .
+```
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `statusline.sh` | Main status line script |
-| `usage-detector.sh` | Usage detection engine (all 3 methods) |
-
-## Standalone Usage Detection
-
-Run the detector directly for JSON output:
-
-```bash
-~/.claude/usage-detector.sh json | jq .
-```
-
-Output:
-```json
-{
-  "plan": "max5",
-  "usage": {
-    "best_percent": 88,
-    "best_method": "prompts",
-    "prompt_percent": 88,
-    "cost_percent": 34,
-    "api_percent": 0,
-    "api_available": false
-  },
-  "prompts": {
-    "counted": 1378,
-    "estimated": 176,
-    "limit_min": 50,
-    "limit_max": 200
-  },
-  "cost": {
-    "current": 12.8,
-    "limit": 35,
-    "burn_rate": 2.7
-  },
-  "time": {
-    "remaining_mins": 135
-  }
-}
-```
+| `statusline.sh` | Main status line (reads Claude Code JSON from stdin) |
+| `usage-detector.sh` | Usage detection engine (3 methods, cross-platform) |
+| `usage-bar.sh` | Standalone usage bar (for terminal prompts) |
+| `install.sh` | Cross-platform installer |
 
 ## Credits
 
-- [ccusage](https://github.com/ryoppippi/ccusage) - Usage analysis from local files
-- [Claude Code Docs](https://code.claude.com/docs/en/statusline) - Status line configuration
+- [ccusage](https://github.com/ryoppippi/ccusage) — Usage analysis from local conversation files
+- [Claude Code Docs](https://docs.anthropic.com/en/docs/claude-code) — Status line configuration
 
 ## License
 
