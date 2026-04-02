@@ -624,11 +624,8 @@ def w_weekly(data: dict, cfg: dict, hist: list) -> str | None:
 
 
 def w_context(data: dict, cfg: dict, hist: list) -> str | None:
-    """Context window: bar + pct + velocity arrows."""
+    """Context window: bar + pct + velocity arrows. Always shown."""
     pct = data["ctx_pct"]
-    if not pct:
-        return None
-
     bw = cfg["bar_width"]
     bar = render_bar(pct, bw)
     vel_str = ""
@@ -642,9 +639,8 @@ def w_context(data: dict, cfg: dict, hist: list) -> str | None:
 
 
 def w_cost(data: dict, cfg: dict) -> str | None:
+    """Always show cost, even $0.00."""
     cost = data["cost_usd"]
-    if not cost:
-        return None
     return tc(format_cost(cost, cfg["currency"]), C_TEXT)
 
 
@@ -682,17 +678,10 @@ def w_git(data: dict, cfg: dict) -> str | None:
 
 
 def w_lines(data: dict, cfg: dict) -> str | None:
-    """Lines added/removed this session."""
+    """Lines added/removed this session. Always shown."""
     added = data.get("lines_added", 0)
     removed = data.get("lines_removed", 0)
-    if not added and not removed:
-        return None
-    parts = []
-    if added:
-        parts.append(tc(f"+{added}", C_LOW))
-    if removed:
-        parts.append(tc(f"-{removed}", C_HIGH))
-    return " ".join(parts)
+    return f"{tc(f'+{added}', C_LOW)} {tc(f'-{removed}', C_HIGH)}"
 
 
 def w_duration(data: dict, cfg: dict) -> str | None:
@@ -724,12 +713,13 @@ def w_peak(data: dict, cfg: dict) -> str | None:
 
 
 def w_telemetry(data: dict, cfg: dict) -> str | None:
-    """Live tool counter from PostToolUse hook."""
+    """Live tool counter from PostToolUse hook. Always shown."""
     telem = read_json(TELEMETRY_FILE)
-    if not telem or not telem.get("tool_count"):
-        return None
+    count = telem.get("tool_count", 0) if telem else 0
 
-    count = telem["tool_count"]
+    if count == 0:
+        return dim("⚡0 tools")
+
     elapsed_min = (time.time() - telem.get("session_start", time.time())) / 60
 
     if elapsed_min > 1 and count > 5:
