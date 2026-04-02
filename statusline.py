@@ -146,6 +146,8 @@ DEFAULT_CONFIG = {
         "git": True,
         "effort": True,
         "peak": True,
+        "lines": True,
+        "duration": True,
         "burn_rate": True,
         "runway_alert": True,
         "reset_timer": True,
@@ -215,21 +217,45 @@ def parse_stdin() -> dict:
     except Exception:
         return {}
 
+    # Debug: save RAW stdin
+    if os.environ.get("STATUSLINE_DEBUG"):
+        _ensure_cache()
+        (CACHE_DIR / "debug_raw.json").write_text(
+            json.dumps(data, indent=2, default=str)
+        )
+
     ctx_pct = _get(data, "context_window.used_percentage", 0) or 0
     ctx_remaining = _get(data, "context_window.remaining_percentage", None)
     tokens_used = _get(data, "context_window.tokens_used", 0) or 0
     token_limit = _get(data, "context_window.token_limit", 0) or 0
+    ctx_size = _get(data, "context_window.context_window_size", 0) or 0
 
-    # Fallback: compute context % from tokens
-    if ctx_pct == 0 and token_limit > 0:
-        ctx_pct = round(tokens_used / token_limit * 100, 1)
+    # Fallback: compute context % from current_usage tokens
+    if ctx_pct == 0 and (token_limit > 0 or ctx_size > 0):
+        limit = token_limit or ctx_size
+        # Try current_usage fields
+        input_tk = _get(data, "context_window.current_usage.input_tokens", 0) or 0
+        cache_create = _get(data, "context_window.current_usage.cache_creation_input_tokens", 0) or 0
+        cache_read = _get(data, "context_window.current_usage.cache_read_input_tokens", 0) or 0
+        total_input = _get(data, "context_window.total_input_tokens", 0) or 0
+        used = (input_tk + cache_create + cache_read) or total_input or tokens_used
+        if used > 0 and limit > 0:
+            ctx_pct = round(used / limit * 100, 1)
 
-    # Handle both field names (used_percentage / percentage_used)
+    # Model: handle both nested {"display_name": "..."} and flat string
+    model_raw = data.get("model", "")
+    if isinstance(model_raw, dict):
+        model = model_raw.get("display_name", "") or model_raw.get("id", "")
+    else:
+        model = str(model_raw) if model_raw else ""
+
+    # Rate limits: handle both field names and both timestamp formats
     def _rate(window: str):
         rl = _get(data, f"rate_limits.{window}", {}) or {}
+        if not isinstance(rl, dict):
+            return 0.0, ""
         pct = rl.get("used_percentage") or rl.get("percentage_used") or 0
         resets = rl.get("resets_at", "")
-        # Normalize: if resets_at is a Unix timestamp (number), convert to ISO
         if isinstance(resets, (int, float)) and resets > 1_000_000_000:
             resets = datetime.fromtimestamp(resets, tz=timezone.utc).isoformat()
         return float(pct), str(resets) if resets else ""
@@ -237,24 +263,35 @@ def parse_stdin() -> dict:
     s_pct, s_resets = _rate("five_hour")
     w_pct, w_resets = _rate("seven_day")
 
+    # Lines: try cost.total_lines_added first, then lines.added
+    lines_added = (_get(data, "cost.total_lines_added", 0) or
+                   _get(data, "lines.added", 0) or 0)
+    lines_removed = (_get(data, "cost.total_lines_removed", 0) or
+                     _get(data, "lines.removed", 0) or 0)
+
+    # Duration
+    duration_ms = _get(data, "cost.total_duration_ms", 0) or 0
+
     return {
-        "model": _get(data, "model.display_name", ""),
+        "model": model,
         "ctx_pct": ctx_pct,
         "ctx_remaining": ctx_remaining,
         "tokens_used": tokens_used,
         "token_limit": token_limit,
+        "ctx_size": ctx_size,
         "cost_usd": _get(data, "cost.total_cost_usd", 0) or 0,
         "session_pct": s_pct,
         "session_resets": s_resets,
         "weekly_pct": w_pct,
         "weekly_resets": w_resets,
-        "cwd": _get(data, "workspace.current_dir", ""),
+        "cwd": _get(data, "workspace.current_dir", "") or _get(data, "cwd", ""),
         "git_branch": _get(data, "workspace.git_branch", ""),
         "vim_mode": _get(data, "vim.mode", ""),
         "agent_name": _get(data, "agent.name", ""),
         "worktree": _get(data, "worktree.branch", ""),
-        "lines_added": _get(data, "lines.added", 0) or 0,
-        "lines_removed": _get(data, "lines.removed", 0) or 0,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "duration_ms": duration_ms,
         "effort": os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", ""),
     }
 
@@ -583,20 +620,21 @@ def w_weekly(data: dict, cfg: dict, hist: list) -> str | None:
 
 
 def w_context(data: dict, cfg: dict, hist: list) -> str | None:
-    """Context window: pct + velocity arrows."""
+    """Context window: bar + pct + velocity arrows."""
     pct = data["ctx_pct"]
     if not pct:
         return None
 
-    color = C_LOW if pct < 70 else (C_MID if pct < 90 else C_HIGH)
-    label = f"Ctx {pct:.0f}%"
+    bw = cfg["bar_width"]
+    bar = render_bar(pct, bw)
+    vel_str = ""
 
     if cfg["show"].get("context_velocity") and hist:
         arrows = velocity_arrows(ctx_velocity(hist))
         if arrows:
-            label += arrows
+            vel_str = arrows
 
-    return tc(label, color)
+    return f"{tc('C', C_TEXT)} {bar} {tc(f'{pct:.0f}%{vel_str}', pct_color(pct))}"
 
 
 def w_cost(data: dict, cfg: dict) -> str | None:
@@ -639,6 +677,36 @@ def w_git(data: dict, cfg: dict) -> str | None:
     return tc(branch, C_TEXT)
 
 
+def w_lines(data: dict, cfg: dict) -> str | None:
+    """Lines added/removed this session."""
+    added = data.get("lines_added", 0)
+    removed = data.get("lines_removed", 0)
+    if not added and not removed:
+        return None
+    parts = []
+    if added:
+        parts.append(tc(f"+{added}", C_LOW))
+    if removed:
+        parts.append(tc(f"-{removed}", C_HIGH))
+    return " ".join(parts)
+
+
+def w_duration(data: dict, cfg: dict) -> str | None:
+    """Session duration."""
+    ms = data.get("duration_ms", 0)
+    if not ms:
+        return None
+    secs = ms / 1000
+    if secs < 60:
+        return dim(f"{secs:.0f}s")
+    mins = secs / 60
+    if mins < 60:
+        return dim(f"{mins:.0f}m")
+    hours = int(mins // 60)
+    m = int(mins % 60)
+    return dim(f"{hours}h{m:02d}m")
+
+
 def w_peak(data: dict, cfg: dict) -> str | None:
     result = check_peak(cfg)
     if not result:
@@ -675,13 +743,15 @@ def render(data: dict, cfg: dict, hist: list) -> str:
 
     # Build widgets in priority order (most important first)
     widget_specs = [
-        ("session", lambda: w_session(data, cfg, hist)),
-        ("weekly",  lambda: w_weekly(data, cfg, hist)),
-        ("context", lambda: w_context(data, cfg, hist)),
-        ("cost",    lambda: w_cost(data, cfg)),
-        ("model",   lambda: w_model(data, cfg)),
-        ("peak",    lambda: w_peak(data, cfg)),
-        ("git",     lambda: w_git(data, cfg)),
+        ("session",  lambda: w_session(data, cfg, hist)),
+        ("weekly",   lambda: w_weekly(data, cfg, hist)),
+        ("context",  lambda: w_context(data, cfg, hist)),
+        ("cost",     lambda: w_cost(data, cfg)),
+        ("model",    lambda: w_model(data, cfg)),
+        ("lines",    lambda: w_lines(data, cfg)),
+        ("duration", lambda: w_duration(data, cfg)),
+        ("peak",     lambda: w_peak(data, cfg)),
+        ("git",      lambda: w_git(data, cfg)),
     ]
     widgets = []
     for name, builder in widget_specs:
@@ -819,15 +889,25 @@ def cli_demo() -> None:
     for pct in (15, 35, 55, 75, 90, 100):
         bar = render_bar(pct, bw)
         print(f"  {pct:>3}%  {bar}")
-    print(f"\n  Sample: {tc('S', C_TEXT)} {render_bar(67, bw)} {tc('67%', pct_color(67))} "
+    print(f"\n  {BOLD}Max plan:{RST}")
+    print(f"  {tc('S', C_TEXT)} {render_bar(67, bw)} {tc('67%', pct_color(67))} "
           f"{dim('↻1h08m')} {tc('12%/h', C_DIM)}"
           f"{_sep()}{tc('W', C_TEXT)} {render_bar(89, bw)} {tc('89%', pct_color(89))} "
           f"{dim('↻Mon 5pm')}"
-          f"{_sep()}{tc('Ctx 45%↑', C_LOW)}"
+          f"{_sep()}{tc('C', C_TEXT)} {render_bar(45, bw)} {tc('45%↑', pct_color(45))}"
           f"{_sep()}{tc('$2.71', C_TEXT)}"
           f"{_sep()}{tc('opus-4.6', C_CYAN)} {tc('H', C_DIM)}"
+          f"{_sep()}{tc('+156', C_LOW)} {tc('-23', C_HIGH)}"
           f"{_sep()}{tc('⚡Peak', C_PEAK)}"
           f"{_sep()}{tc('main', C_TEXT)}{dim('*2')}")
+    print(f"\n  {BOLD}Enterprise:{RST}")
+    print(f"  {tc('C', C_TEXT)} {render_bar(14, bw)} {tc('14%', pct_color(14))}"
+          f"{_sep()}{tc('$14.30', C_TEXT)}"
+          f"{_sep()}{tc('opus 4.6 (1m context)', C_CYAN)}"
+          f"{_sep()}{tc('+987', C_LOW)} {tc('-226', C_HIGH)}"
+          f"{_sep()}{dim('42m')}"
+          f"{_sep()}{tc('⚡Peak', C_PEAK)}"
+          f"{_sep()}{tc('main', C_TEXT)}{dim('*5')}")
 
 
 def usage() -> None:
@@ -893,6 +973,13 @@ def main() -> None:
     try:
         cfg = load_config()
         data = parse_stdin()
+
+        # Debug: save raw stdin for diagnosis
+        if os.environ.get("STATUSLINE_DEBUG"):
+            _ensure_cache()
+            (CACHE_DIR / "debug_stdin.json").write_text(
+                json.dumps(data, indent=2, default=str)
+            )
 
         if not data:
             print(tc("Claude", C_TEXT))
