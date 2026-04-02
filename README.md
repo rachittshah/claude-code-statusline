@@ -1,167 +1,75 @@
-# Claude Code Status Line v2
+# claude-code-statusline
 
-Rich status line for Claude Code CLI — shows model, vim mode, agent, context, git, lines changed, cost, duration, and usage tracking.
-
-## Preview
+A status bar for Claude Code that tells you not just where you are, but whether you need to act.
 
 ```
-astroscore │ Opus │ N │ security-reviewer │ ██████░░░░ 55% │ main*3 │ +156-23 │ $0.01 │ 45s │ ███████░ 88% 5x │ r:2h15m
+S ████████▍─ 73% ↻1h08m 12%/h │ W █████████▊ 92% ↻Mon 5pm │ Ctx 45%↑ │ $2.71 │ opus-4.6 H │ ⚡Peak │ main*2
 ```
 
-| Segment | Source Field | Description |
-|---------|-------------|-------------|
-| `astroscore` | `workspace.current_dir` | Current directory (basename) |
-| `Opus` | `model.display_name` | Active model |
-| `N` | `vim.mode` | Vim mode (N/I/V/R) |
-| `security-reviewer` | `agent.name` | Active agent name |
-| `██████░░░░ 55%` | `context_window.used_percentage` | Context window usage |
-| `!` | `exceeds_200k_tokens` | Context overflow warning |
-| `main*3` | git status | Branch + dirty file count |
-| `+156-23` | `cost.total_lines_added/removed` | Lines changed this session |
-| `$0.01` | `cost.total_cost_usd` | Session cost |
-| `45s` | `cost.total_duration_ms` | Session duration |
-| `███████░ 88% 5x` | usage-detector | 5-hour usage % + plan badge |
-| `r:2h15m` | usage-detector | Time until limit reset |
-
-Segments are hidden when their data is empty (no vim mode = no vim segment, etc.).
-
-## Installation
-
-### Prerequisites
-
-- `jq` (required)
-- `bun` (optional, for usage tracking via [ccusage](https://github.com/ryoppippi/ccusage))
-
-### Quick Install
+## Install
 
 ```bash
-git clone https://github.com/rachittshah/claude-code-statusline.git
-cd claude-code-statusline
-bash install.sh
+git clone https://github.com/rachittshah/claude-code-statusline ~/.claude-statusline
+cd ~/.claude-statusline && bash install.sh
 ```
 
-### Manual Install
+Restart Claude Code. Done.
 
-```bash
-# macOS
-brew install jq
+## What it shows
 
-# Linux (Debian/Ubuntu)
-sudo apt-get install -y jq
+| Widget | What you see | What it means |
+|--------|-------------|---------------|
+| **Session** | `S ████████▍─ 73% ↻1h08m` | 5-hour usage at 73%, resets in 1h08m |
+| **Burn rate** | `12%/h` | Burning 12% per hour at current pace |
+| **Runway alert** | `⚠~45m` | You'll hit the limit before it resets. Slow down. |
+| **Weekly** | `W █████████▊ 92% ↻Mon 5pm` | 7-day usage at 92%, resets Monday 5pm |
+| **Context** | `Ctx 45%↑` | Context window 45% full, growing (↑↑↑ = fast) |
+| **Cost** | `$2.71` | Session cost in your currency |
+| **Model** | `opus-4.6 H` | Current model + effort level (H/M/L) |
+| **Peak** | `⚡Peak` | Anthropic's 2x consumption window is active |
+| **Git** | `main*2` | Branch with 2 dirty files |
 
-# Copy scripts
-mkdir -p ~/.claude/statusline
-cp statusline.sh usage-detector.sh usage-bar.sh ~/.claude/statusline/
-chmod +x ~/.claude/statusline/*.sh
-```
-
-Add to `~/.claude/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "$HOME/.claude/statusline/statusline.sh"
-  }
-}
-```
+The runway alert only appears when you're on track to hit rate limits before they reset. No alert = you're fine.
 
 ## Features
 
-- **Native JSON fields** — Uses `cost.total_cost_usd`, `context_window.used_percentage`, `vim.mode`, `agent.name`, etc.
-- **Single jq call** — All fields extracted in one pass (4x faster than v1)
-- **Cross-platform** — Works on macOS and Linux
-- **Backward compatible** — Falls back to token-based context calculation when `used_percentage` is unavailable
-- **Auto-detects plan** — Pro, Max 5x, Max 20x, or API (via credential metadata)
-- **3 usage detection methods** — Anthropic API, prompt estimation, cost-based
-- **Context overflow warning** — Shows `!` when `exceeds_200k_tokens` is true
+- **Burn rate + runway prediction** — Linear regression over your usage history predicts when you'll hit limits. The bar warns you before it happens.
+- **Context velocity** — Arrows (↑/↑↑/↑↑↑) show how fast your context window is filling up.
+- **Peak hours** — Warns when Anthropic's 2x consumption window is active.
+- **One color palette** — Traffic-light gradient (green → amber → red). No theme bloat.
+- **Smart layout** — Adapts to terminal width. Drops low-priority widgets to fit.
+- **Zero dependencies** — Pure Python stdlib. No pip, no npm, no cargo.
+- **Sub-50ms** — Aggressive caching on git status and FX rates. Hot path is <10ms.
+- **Currency conversion** — Live exchange rates, cached 24h. 17 currencies supported.
+- **Never crashes** — Graceful fallback on any error. Always shows something.
 
-## JSON Schema Reference
-
-<details>
-<summary>Full input JSON schema (click to expand)</summary>
-
-```json
-{
-  "hook_event_name": "Status",
-  "model": {
-    "display_name": "Opus"
-  },
-  "workspace": {
-    "current_dir": "/home/user/project"
-  },
-  "context_window": {
-    "used_percentage": 55,
-    "context_window_size": 200000,
-    "current_usage": {
-      "input_tokens": 50000,
-      "cache_creation_input_tokens": 10000,
-      "cache_read_input_tokens": 5000
-    }
-  },
-  "cost": {
-    "total_cost_usd": 0.01234,
-    "total_duration_ms": 45000,
-    "total_lines_added": 156,
-    "total_lines_removed": 23
-  },
-  "exceeds_200k_tokens": false,
-  "vim": {
-    "mode": "NORMAL"
-  },
-  "agent": {
-    "name": "security-reviewer"
-  }
-}
-```
-
-</details>
-
-## Usage Tracking
-
-### Plan Auto-Detection
-
-The detector identifies your plan from credential metadata:
-
-1. **API key**: `ANTHROPIC_API_KEY` set — API mode (no usage tracking)
-2. **Credential metadata**: Reads `subscriptionType`/`rateLimitTier` from:
-   - macOS: Keychain (`Claude Code-credentials`)
-   - Linux: `~/.claude/.credentials.json`
-3. **Cost inference**: Falls back to historical cost (via ccusage)
-
-Override manually:
+## Configure
 
 ```bash
-export CLAUDE_PLAN=max20  # pro, max5, max20, api
+python3 ~/.claude-statusline/statusline.py --config           # Show settings
+python3 ~/.claude-statusline/statusline.py --demo             # Preview the bar
+python3 ~/.claude-statusline/statusline.py --currency £        # Set currency
+python3 ~/.claude-statusline/statusline.py --bar-width large   # Bar width (small/medium/large/xl or 4-20)
+python3 ~/.claude-statusline/statusline.py --show burn_rate    # Enable a widget
+python3 ~/.claude-statusline/statusline.py --hide peak         # Disable a widget
+python3 ~/.claude-statusline/statusline.py --peak-hours 13:00-19:00  # Set peak window
+python3 ~/.claude-statusline/statusline.py --reset             # Factory reset
 ```
 
-### Plan Limits
+### Widgets you can show/hide
 
-| Plan | Prompts/5hr | Cost Limit |
-|------|-------------|------------|
-| Pro | 10-40 | ~$10 |
-| Max 5x | 50-200 | ~$50 |
-| Max 20x | 200-800 | ~$200 |
+`session` · `weekly` · `context` · `cost` · `model` · `git` · `effort` · `peak` · `burn_rate` · `runway_alert` · `reset_timer` · `context_velocity`
 
-### Standalone Usage
+## How it works
 
-```bash
-~/.claude/statusline/usage-detector.sh json | jq .
-```
+Claude Code pipes JSON to stdin on each interaction. This script parses it, computes derived metrics (burn rate via linear regression, context velocity, runway prediction), and outputs an ANSI-colored status line. No API calls, no token consumption — everything runs locally.
 
-## Files
+Usage data comes from Claude Code's native `rate_limits` field (available since v2.1.80). No OAuth tokens, no credential scraping, no third-party tools.
 
-| File | Description |
-|------|-------------|
-| `statusline.sh` | Main status line (reads Claude Code JSON from stdin) |
-| `usage-detector.sh` | Usage detection engine (3 methods, cross-platform) |
-| `usage-bar.sh` | Standalone usage bar (for terminal prompts) |
-| `install.sh` | Cross-platform installer |
+## Requirements
 
-## Credits
-
-- [ccusage](https://github.com/ryoppippi/ccusage) — Usage analysis from local conversation files
-- [Claude Code Docs](https://docs.anthropic.com/en/docs/claude-code) — Status line configuration
+- Python 3.8+
+- Claude Code (any recent version; rate limit bars require v2.1.80+)
 
 ## License
 

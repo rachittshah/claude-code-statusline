@@ -1,0 +1,878 @@
+#!/usr/bin/env python3
+"""
+Claude Code Statusline — glanceable intelligence for your terminal.
+
+A status bar that tells you not just where you are, but whether you need to act.
+One color palette. No configuration bloat. Pure signal.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ─── Constants ───────────────────────────────────────────────────────────────────
+
+VERSION = "2.0.0"
+
+CONFIG_DIR = Path.home() / ".config" / "claude-statusline"
+CACHE_DIR = Path.home() / ".cache" / "claude-statusline"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+HISTORY_FILE = CACHE_DIR / "history.json"
+GIT_CACHE_FILE = CACHE_DIR / "git_cache.json"
+FX_CACHE_FILE = CACHE_DIR / "fx_cache.json"
+
+# Unicode sub-character blocks for bar precision (9 levels: empty through full)
+BLOCKS = " ▏▎▍▌▋▊▉█"
+
+RST = "\033[0m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+
+HISTORY_MAX_AGE = 1800      # 30 minutes of samples
+HISTORY_MAX_SAMPLES = 360   # ~1 sample per 5 seconds
+HISTORY_MIN_INTERVAL = 5    # seconds between samples
+GIT_CACHE_TTL = 10          # seconds
+FX_CACHE_TTL = 86400        # 24 hours
+
+# ─── The Palette ─────────────────────────────────────────────────────────────────
+#
+# One palette. Traffic-light legibility on any dark terminal.
+# Green = safe. Amber = attention. Red = act now.
+#
+
+C_LOW  = (34, 197, 94)     # Emerald — safe zone
+C_MID  = (245, 158, 11)    # Amber — attention zone
+C_HIGH = (239, 68, 68)     # Red — danger zone
+C_TEXT = (209, 213, 219)    # Soft white — labels and values
+C_DIM  = (100, 116, 139)   # Slate — separators, secondary info
+C_CYAN = (34, 211, 238)    # Cyan — model name accent
+C_BLUE = (96, 165, 250)    # Blue — directory accent
+C_PEAK = (250, 204, 21)    # Gold — peak hours warning
+
+
+# ─── Color Utilities ─────────────────────────────────────────────────────────────
+
+def fg(r: int, g: int, b: int) -> str:
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+def lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * max(0.0, min(1.0, t))
+
+
+def lerp_color(c1: tuple, c2: tuple, t: float) -> tuple:
+    return (int(lerp(c1[0], c2[0], t)),
+            int(lerp(c1[1], c2[1], t)),
+            int(lerp(c1[2], c2[2], t)))
+
+
+def pct_color(pct: float) -> tuple:
+    """Map 0-100% to the traffic-light gradient."""
+    pct = max(0.0, min(100.0, pct))
+    if pct <= 60:
+        return lerp_color(C_LOW, C_MID, pct / 60)
+    return lerp_color(C_MID, C_HIGH, (pct - 60) / 40)
+
+
+def tc(s: str, color: tuple) -> str:
+    """Apply truecolor to string."""
+    return f"{fg(*color)}{s}{RST}"
+
+
+def dim(s: str) -> str:
+    return f"{fg(*C_DIM)}{s}{RST}"
+
+
+def visible_len(s: str) -> int:
+    return len(re.sub(r'\033\[[^m]*m', '', s))
+
+
+# ─── Bar Rendering ───────────────────────────────────────────────────────────────
+
+def render_bar(pct: float, width: int = 10) -> str:
+    """
+    Render a Unicode progress bar with truecolor.
+
+    The entire filled portion is ONE color determined by the percentage.
+    Green = safe. Amber = attention. Red = act now.
+    Sub-character precision via Unicode block elements.
+    """
+    pct = max(0.0, min(100.0, pct))
+    color = pct_color(pct)
+    fill_exact = pct / 100 * width
+    fill_full = int(fill_exact)
+    partial_idx = int((fill_exact - fill_full) * 8)
+
+    parts = []
+
+    # Filled blocks
+    if fill_full > 0:
+        parts.append(f"{fg(*color)}{'█' * fill_full}")
+
+    # Partial block
+    if partial_idx > 0 and fill_full < width:
+        parts.append(f"{fg(*color)}{BLOCKS[partial_idx]}")
+        empty_start = fill_full + 1
+    else:
+        empty_start = fill_full
+
+    # Empty portion
+    empty_count = width - empty_start
+    if empty_count > 0:
+        parts.append(f"{fg(*C_DIM)}{'─' * empty_count}")
+
+    return "".join(parts) + RST
+
+
+# ─── Configuration ───────────────────────────────────────────────────────────────
+
+DEFAULT_CONFIG = {
+    "currency": "$",
+    "bar_width": 10,
+    "peak_hours": {"enabled": True, "start": "13:00", "end": "19:00"},
+    "show": {
+        "session": True,
+        "weekly": True,
+        "context": True,
+        "cost": True,
+        "model": True,
+        "git": True,
+        "effort": True,
+        "peak": True,
+        "burn_rate": True,
+        "runway_alert": True,
+        "reset_timer": True,
+        "context_velocity": True,
+    },
+}
+
+
+def load_config() -> dict:
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        if CONFIG_FILE.exists():
+            user = json.loads(CONFIG_FILE.read_text())
+            if "show" in user:
+                config["show"].update(user.pop("show"))
+            config.update(user)
+    except Exception:
+        pass
+    return config
+
+
+def save_config(config: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2) + "\n")
+    tmp.replace(CONFIG_FILE)
+
+
+# ─── Cache ───────────────────────────────────────────────────────────────────────
+
+def _ensure_cache():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text()) if path.exists() else None
+    except Exception:
+        return None
+
+
+def write_json(path: Path, data) -> None:
+    _ensure_cache()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+
+# ─── Stdin Parser ────────────────────────────────────────────────────────────────
+
+def _get(data: dict, path: str, default=None):
+    obj = data
+    for key in path.split("."):
+        if isinstance(obj, dict):
+            obj = obj.get(key)
+        else:
+            return default
+    return obj if obj is not None else default
+
+
+def parse_stdin() -> dict:
+    try:
+        raw = sys.stdin.read()
+        if not raw.strip():
+            return {}
+        data = json.loads(raw)
+    except Exception:
+        return {}
+
+    ctx_pct = _get(data, "context_window.used_percentage", 0) or 0
+    tokens_used = _get(data, "context_window.tokens_used", 0) or 0
+    token_limit = _get(data, "context_window.token_limit", 0) or 0
+
+    # Fallback: compute context % from tokens
+    if ctx_pct == 0 and token_limit > 0:
+        ctx_pct = round(tokens_used / token_limit * 100, 1)
+
+    return {
+        "model": _get(data, "model.display_name", ""),
+        "ctx_pct": ctx_pct,
+        "tokens_used": tokens_used,
+        "token_limit": token_limit,
+        "cost_usd": _get(data, "cost.total_cost_usd", 0) or 0,
+        "session_pct": _get(data, "rate_limits.five_hour.percentage_used", 0) or 0,
+        "session_resets": _get(data, "rate_limits.five_hour.resets_at", ""),
+        "weekly_pct": _get(data, "rate_limits.seven_day.percentage_used", 0) or 0,
+        "weekly_resets": _get(data, "rate_limits.seven_day.resets_at", ""),
+        "cwd": _get(data, "workspace.current_dir", ""),
+        "git_branch": _get(data, "workspace.git_branch", ""),
+        "vim_mode": _get(data, "vim.mode", ""),
+        "agent_name": _get(data, "agent.name", ""),
+        "worktree": _get(data, "worktree.branch", ""),
+        "lines_added": _get(data, "lines.added", 0) or 0,
+        "lines_removed": _get(data, "lines.removed", 0) or 0,
+        "effort": os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", ""),
+    }
+
+
+# ─── History & Burn Rate ─────────────────────────────────────────────────────────
+
+def load_history() -> list:
+    data = read_json(HISTORY_FILE)
+    return data if isinstance(data, list) else []
+
+
+def record_history(history: list, s_pct: float, w_pct: float, c_pct: float) -> list:
+    """Append a sample. Rate-limited to one per HISTORY_MIN_INTERVAL seconds."""
+    now = time.time()
+    if s_pct == 0 and w_pct == 0 and c_pct == 0:
+        return history
+    if history and now - history[-1]["t"] < HISTORY_MIN_INTERVAL:
+        return history
+
+    history.append({"t": now, "s": round(s_pct, 1), "w": round(w_pct, 1), "c": round(c_pct, 1)})
+
+    # Prune
+    cutoff = now - HISTORY_MAX_AGE
+    history = [h for h in history if h["t"] >= cutoff][-HISTORY_MAX_SAMPLES:]
+    write_json(HISTORY_FILE, history)
+    return history
+
+
+def burn_rate(history: list, key: str = "s", window_min: int = 15):
+    """
+    Linear regression over recent history.
+    Returns (pct_per_hour, minutes_to_100%) or (None, None).
+    """
+    now = time.time()
+    pts = [(h["t"], h[key]) for h in history if h["t"] >= now - window_min * 60 and key in h]
+    if len(pts) < 3:
+        return None, None
+
+    n = len(pts)
+    t0 = pts[0][0]
+    xs = [(p[0] - t0) / 60 for p in pts]
+    ys = [p[1] for p in pts]
+    xm = sum(xs) / n
+    ym = sum(ys) / n
+    ss_xy = sum((x - xm) * (y - ym) for x, y in zip(xs, ys))
+    ss_xx = sum((x - xm) ** 2 for x in xs)
+
+    if ss_xx < 0.001:
+        return 0.0, None
+
+    slope = ss_xy / ss_xx  # pct per minute
+    if slope <= 0.01:
+        return 0.0, None
+
+    remaining = 100 - ys[-1]
+    if remaining <= 0:
+        return round(slope * 60, 1), 0.0
+
+    return round(slope * 60, 1), round(remaining / slope, 1)
+
+
+# ─── Context Velocity ────────────────────────────────────────────────────────────
+
+def ctx_velocity(history: list, window_sec: int = 120) -> float:
+    """Context growth rate in pct/minute."""
+    now = time.time()
+    pts = [(h["t"], h["c"]) for h in history if h["t"] >= now - window_sec and "c" in h]
+    if len(pts) < 2:
+        return 0.0
+    dp = pts[-1][1] - pts[0][1]
+    dt = pts[-1][0] - pts[0][0]
+    return dp / dt * 60 if dt > 5 else 0.0
+
+
+def velocity_arrows(vel: float) -> str:
+    if vel > 5:   return "↑↑↑"
+    if vel > 2:   return "↑↑"
+    if vel > 0.5: return "↑"
+    if vel < -0.5: return "↓"
+    return ""
+
+
+# ─── Peak Hours ──────────────────────────────────────────────────────────────────
+
+def check_peak(config: dict):
+    """Returns ("in_peak", mins_left) | ("approaching", mins_until) | None"""
+    ph = config.get("peak_hours", {})
+    if not ph.get("enabled", True):
+        return None
+    try:
+        now = datetime.now()
+        sh, sm = map(int, ph.get("start", "13:00").split(":"))
+        eh, em = map(int, ph.get("end", "19:00").split(":"))
+        start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if start <= now <= end:
+            return ("in_peak", (end - now).total_seconds() / 60)
+        if now < start and (start - now).total_seconds() / 60 <= 60:
+            return ("approaching", (start - now).total_seconds() / 60)
+        return None
+    except Exception:
+        return None
+
+
+# ─── Git Status ──────────────────────────────────────────────────────────────────
+
+def git_info(cwd: str, stdin_branch: str) -> dict:
+    """Branch + dirty count, cached for GIT_CACHE_TTL seconds."""
+    if not cwd:
+        return {"branch": "", "dirty": 0}
+
+    cache = read_json(GIT_CACHE_FILE)
+    if cache and cache.get("cwd") == cwd and time.time() - cache.get("t", 0) < GIT_CACHE_TTL:
+        branch = stdin_branch or cache.get("branch", "")
+        return {"branch": branch, "dirty": cache.get("dirty", 0)}
+
+    branch = stdin_branch
+    dirty = 0
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd, "status", "--porcelain", "-uno"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if r.returncode == 0:
+            dirty = sum(1 for line in r.stdout.strip().split("\n") if line.strip())
+            if not branch:
+                br = subprocess.run(
+                    ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                branch = br.stdout.strip() if br.returncode == 0 else ""
+    except Exception:
+        pass
+
+    write_json(GIT_CACHE_FILE, {"t": time.time(), "cwd": cwd, "branch": branch, "dirty": dirty})
+    return {"branch": branch, "dirty": dirty}
+
+
+# ─── Currency ────────────────────────────────────────────────────────────────────
+
+SYMBOL_TO_CODE = {
+    "£": "GBP", "€": "EUR", "¥": "JPY", "₹": "INR", "₩": "KRW",
+    "C$": "CAD", "A$": "AUD", "NZ$": "NZD", "kr": "SEK", "R$": "BRL",
+    "zł": "PLN", "Fr": "CHF", "₺": "TRY", "₱": "PHP", "฿": "THB",
+    "R": "ZAR", "Rp": "IDR", "RM": "MYR",
+}
+
+FALLBACK_FX = {
+    "GBP": 0.79, "EUR": 0.92, "JPY": 149.5, "INR": 83.3, "KRW": 1320,
+    "CAD": 1.36, "AUD": 1.53, "NZD": 1.64, "SEK": 10.5, "BRL": 4.97,
+    "PLN": 4.03, "CHF": 0.88, "TRY": 30.2, "PHP": 55.8, "THB": 35.3,
+    "ZAR": 18.6, "IDR": 15500, "MYR": 4.72,
+}
+
+
+def _fx_rate(code: str) -> float:
+    cache = read_json(FX_CACHE_FILE)
+    if cache and time.time() - cache.get("t", 0) < FX_CACHE_TTL:
+        return cache.get("rates", {}).get(code, FALLBACK_FX.get(code, 1))
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.frankfurter.dev/v1/latest?from=USD",
+            headers={"User-Agent": "claude-statusline"},
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+            write_json(FX_CACHE_FILE, {"t": time.time(), "rates": data.get("rates", {})})
+            return data["rates"].get(code, FALLBACK_FX.get(code, 1))
+    except Exception:
+        return FALLBACK_FX.get(code, 1)
+
+
+def format_cost(usd: float, symbol: str) -> str:
+    if symbol == "$" or not symbol:
+        return f"${usd:.2f}"
+    code = SYMBOL_TO_CODE.get(symbol)
+    if not code:
+        return f"{symbol}{usd:.2f}"
+    converted = usd * _fx_rate(code)
+    if converted >= 1000:
+        return f"{symbol}{converted:,.0f}"
+    if converted >= 100:
+        return f"{symbol}{converted:.0f}"
+    return f"{symbol}{converted:.2f}"
+
+
+# ─── Time Formatting ─────────────────────────────────────────────────────────────
+
+def format_reset(iso_str: str) -> str:
+    """ISO timestamp → human countdown."""
+    if not iso_str:
+        return ""
+    try:
+        s = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        secs = (dt - now).total_seconds()
+        if secs <= 0:
+            return "now"
+        h, rem = divmod(int(secs), 3600)
+        m = rem // 60
+        if h >= 24:
+            return f"{dt.strftime('%a')} {dt.strftime('%-I%p').lower()}"
+        if h > 0:
+            return f"{h}h{m:02d}m"
+        return f"{m}m" if m > 0 else "<1m"
+    except Exception:
+        return ""
+
+
+def _reset_minutes(iso_str: str) -> float:
+    """Parse reset time and return minutes until reset."""
+    if not iso_str:
+        return 0
+    try:
+        s = iso_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, (dt - datetime.now(timezone.utc)).total_seconds() / 60)
+    except Exception:
+        return 0
+
+
+def format_runway(minutes: float) -> str:
+    if minutes <= 0:
+        return ""
+    if minutes >= 1440:
+        return f"~{minutes / 1440:.0f}d"
+    if minutes >= 60:
+        return f"~{int(minutes // 60)}h{int(minutes % 60):02d}m"
+    return f"~{minutes:.0f}m"
+
+
+# ─── Widgets ─────────────────────────────────────────────────────────────────────
+#
+# Each widget returns a string or None (hidden).
+# Design rule: only show information that helps the user DECIDE something.
+#
+
+SEP = None  # set in render()
+
+
+def _sep() -> str:
+    return f" {fg(*C_DIM)}│{RST} "
+
+
+def w_session(data: dict, cfg: dict, hist: list) -> str | None:
+    """Session usage: bar + pct + reset timer + burn rate + runway alert."""
+    pct = data["session_pct"]
+    if not pct and not data["session_resets"]:
+        return None
+
+    show = cfg["show"]
+    bw = cfg["bar_width"]
+    bar = render_bar(pct, bw)
+    parts = [f"{tc('S', C_TEXT)} {bar} {tc(f'{pct:.0f}%', pct_color(pct))}"]
+
+    # Reset timer
+    if show.get("reset_timer"):
+        timer = format_reset(data["session_resets"])
+        if timer:
+            parts.append(dim(f"↻{timer}"))
+
+    # Burn rate
+    rate_val, runway_min = None, None
+    if show.get("burn_rate") and hist:
+        rate_val, runway_min = burn_rate(hist, "s")
+        if rate_val and rate_val > 0:
+            parts.append(tc(f"{rate_val:.0f}%/h", C_DIM))
+
+    # Runway alert: only appears when you'll hit the limit before reset
+    if show.get("runway_alert") and runway_min is not None and runway_min > 0:
+        reset_min = _reset_minutes(data["session_resets"])
+        if reset_min > 0:
+            if runway_min < reset_min * 0.8:
+                # DANGER: will hit limit before reset
+                alert = format_runway(runway_min)
+                parts.append(tc(f"⚠{alert}", C_HIGH))
+            elif runway_min < reset_min * 1.3:
+                # WARNING: cutting it close
+                alert = format_runway(runway_min)
+                parts.append(tc(f"→{alert}", C_MID))
+
+    return " ".join(parts)
+
+
+def w_weekly(data: dict, cfg: dict, hist: list) -> str | None:
+    """Weekly usage: bar + pct + reset timer."""
+    pct = data["weekly_pct"]
+    if not pct and not data["weekly_resets"]:
+        return None
+
+    bw = cfg["bar_width"]
+    bar = render_bar(pct, bw)
+    parts = [f"{tc('W', C_TEXT)} {bar} {tc(f'{pct:.0f}%', pct_color(pct))}"]
+
+    if cfg["show"].get("reset_timer"):
+        timer = format_reset(data["weekly_resets"])
+        if timer:
+            parts.append(dim(f"↻{timer}"))
+
+    return " ".join(parts)
+
+
+def w_context(data: dict, cfg: dict, hist: list) -> str | None:
+    """Context window: pct + velocity arrows."""
+    pct = data["ctx_pct"]
+    if not pct:
+        return None
+
+    color = C_LOW if pct < 70 else (C_MID if pct < 90 else C_HIGH)
+    label = f"Ctx {pct:.0f}%"
+
+    if cfg["show"].get("context_velocity") and hist:
+        arrows = velocity_arrows(ctx_velocity(hist))
+        if arrows:
+            label += arrows
+
+    return tc(label, color)
+
+
+def w_cost(data: dict, cfg: dict) -> str | None:
+    cost = data["cost_usd"]
+    if not cost:
+        return None
+    return tc(format_cost(cost, cfg["currency"]), C_TEXT)
+
+
+def w_model(data: dict, cfg: dict) -> str | None:
+    model = data["model"]
+    if not model:
+        return None
+
+    display = model.lower()
+    for prefix in ("claude ", "claude-"):
+        if display.startswith(prefix):
+            display = display[len(prefix):]
+
+    parts = [tc(display, C_CYAN)]
+
+    if cfg["show"].get("effort"):
+        effort = data.get("effort", "")
+        if effort and effort.lower() not in ("", "default"):
+            parts.append(tc(effort[0].upper(), C_DIM))
+
+    return " ".join(parts)
+
+
+def w_git(data: dict, cfg: dict) -> str | None:
+    branch_hint = data.get("git_branch", "") or data.get("worktree", "")
+    info = git_info(data["cwd"], branch_hint)
+    branch = info["branch"]
+    if not branch:
+        return None
+
+    dirty = info["dirty"]
+    if dirty > 0:
+        return f"{tc(branch, C_TEXT)}{dim(f'*{dirty}')}"
+    return tc(branch, C_TEXT)
+
+
+def w_peak(data: dict, cfg: dict) -> str | None:
+    result = check_peak(cfg)
+    if not result:
+        return None
+    state, mins = result
+    if state == "in_peak":
+        return tc("⚡Peak", C_PEAK)
+    if state == "approaching" and mins is not None:
+        return dim(f"⚡{mins:.0f}m")
+    return None
+
+
+# ─── Layout ──────────────────────────────────────────────────────────────────────
+
+def terminal_width() -> int:
+    for fd in (sys.stderr.fileno(), sys.stdout.fileno(), sys.stdin.fileno()):
+        try:
+            return os.get_terminal_size(fd).columns
+        except Exception:
+            continue
+    try:
+        return int(os.environ.get("COLUMNS", "120"))
+    except Exception:
+        return 120
+
+
+def render(data: dict, cfg: dict, hist: list) -> str:
+    """Assemble the status line. Responsive: drops low-priority widgets to fit."""
+    # If no meaningful data arrived, show fallback
+    if not data.get("model") and not data.get("session_pct") and not data.get("ctx_pct"):
+        return tc("Claude", C_TEXT)
+
+    show = cfg["show"]
+
+    # Build widgets in priority order (most important first)
+    widgets = []
+    if show.get("session"):
+        w = w_session(data, cfg, hist)
+        if w: widgets.append(w)
+    if show.get("weekly"):
+        w = w_weekly(data, cfg, hist)
+        if w: widgets.append(w)
+    if show.get("context"):
+        w = w_context(data, cfg, hist)
+        if w: widgets.append(w)
+    if show.get("cost"):
+        w = w_cost(data, cfg)
+        if w: widgets.append(w)
+    if show.get("model"):
+        w = w_model(data, cfg)
+        if w: widgets.append(w)
+    if show.get("peak"):
+        w = w_peak(data, cfg)
+        if w: widgets.append(w)
+    if show.get("git"):
+        w = w_git(data, cfg)
+        if w: widgets.append(w)
+
+    if not widgets:
+        return tc("Claude", C_TEXT)
+
+    sep = _sep()
+    sep_vlen = 3
+    tw = terminal_width() - 2
+
+    # Try full set, then progressively drop from the tail
+    for drop in range(len(widgets)):
+        active = widgets[: len(widgets) - drop] if drop else widgets
+        line = sep.join(active)
+        if visible_len(line) <= tw:
+            return line
+
+    return widgets[0]
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────────
+
+def cli_install() -> None:
+    script = str(Path(__file__).resolve())
+    python = sys.executable
+    cmd = f'{python} "{script}"'
+
+    settings_path = Path.home() / ".claude" / "settings.json"
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text())
+        except Exception:
+            settings = {}
+    else:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings = {}
+
+    settings["statusLine"] = {"type": "command", "command": cmd}
+    tmp = settings_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    tmp.replace(settings_path)
+
+    print(f"{BOLD}Installed.{RST}")
+    print(f"  Python:   {python}")
+    print(f"  Script:   {script}")
+    print(f"  Settings: {settings_path}")
+    print("\nRestart Claude Code to activate.")
+
+
+def cli_config() -> None:
+    cfg = load_config()
+    bar = render_bar(65, cfg["bar_width"])
+    ph = cfg.get("peak_hours", {})
+    peak = f"{ph.get('start', '13:00')}-{ph.get('end', '19:00')}" if ph.get("enabled") else "off"
+
+    print(f"{BOLD}claude-statusline v{VERSION}{RST}\n")
+    print(f"  Palette:    {render_bar(20, 4)} {render_bar(50, 4)} {render_bar(80, 4)}")
+    print(f"  Currency:   {cfg.get('currency', '$')}")
+    print(f"  Bar width:  {cfg.get('bar_width', 10)}")
+    print(f"  Peak hours: {peak}")
+    print(f"\n  {BOLD}Widgets:{RST}")
+    for key, val in cfg.get("show", {}).items():
+        s = "\033[32mon\033[0m" if val else "\033[31moff\033[0m"
+        print(f"    {key:<20} {s}")
+
+
+def cli_currency(symbol: str) -> None:
+    cfg = load_config()
+    cfg["currency"] = symbol
+    save_config(cfg)
+    print(f"Currency: {BOLD}{symbol}{RST}")
+    code = SYMBOL_TO_CODE.get(symbol)
+    if code:
+        rate = _fx_rate(code)
+        print(f"  $1 USD = {symbol}{rate:.2f} {code}")
+
+
+def cli_bar_width(val: str) -> None:
+    sizes = {"small": 6, "medium": 8, "large": 10, "xl": 14}
+    try:
+        w = int(val)
+    except ValueError:
+        w = sizes.get(val.lower())
+        if w is None:
+            print(f"Use a number (4-20) or: {', '.join(sizes)}")
+            sys.exit(1)
+    if not 4 <= w <= 20:
+        print("Bar width must be 4-20")
+        sys.exit(1)
+
+    cfg = load_config()
+    cfg["bar_width"] = w
+    save_config(cfg)
+    print(f"Bar width: {BOLD}{w}{RST}  {render_bar(65, w)}")
+
+
+def cli_toggle(action: str, widget: str) -> None:
+    cfg = load_config()
+    valid = set(DEFAULT_CONFIG["show"])
+    if widget not in valid:
+        print(f"Unknown widget: {widget}\nAvailable: {', '.join(sorted(valid))}")
+        sys.exit(1)
+    cfg["show"][widget] = action == "show"
+    save_config(cfg)
+    print(f"Widget '{widget}' {'shown' if action == 'show' else 'hidden'}")
+
+
+def cli_peak(val: str) -> None:
+    cfg = load_config()
+    if val.lower() == "off":
+        cfg["peak_hours"]["enabled"] = False
+    elif val.lower() == "on":
+        cfg["peak_hours"]["enabled"] = True
+    elif "-" in val:
+        parts = val.split("-", 1)
+        cfg["peak_hours"] = {"enabled": True, "start": parts[0].strip(), "end": parts[1].strip()}
+    else:
+        print("Usage: --peak-hours <HH:MM-HH:MM | on | off>")
+        sys.exit(1)
+    save_config(cfg)
+    ph = cfg["peak_hours"]
+    print(f"Peak hours: {BOLD}{ph['start']}-{ph['end']}{RST}" if ph["enabled"] else "Peak hours: off")
+
+
+def cli_demo() -> None:
+    """Show a demo of the status line at different usage levels."""
+    bw = load_config()["bar_width"]
+    print(f"{BOLD}claude-statusline v{VERSION}{RST}\n")
+    for pct in (15, 35, 55, 75, 90, 100):
+        bar = render_bar(pct, bw)
+        print(f"  {pct:>3}%  {bar}")
+    print(f"\n  Sample: {tc('S', C_TEXT)} {render_bar(67, bw)} {tc('67%', pct_color(67))} "
+          f"{dim('↻1h08m')} {tc('12%/h', C_DIM)}"
+          f"{_sep()}{tc('W', C_TEXT)} {render_bar(89, bw)} {tc('89%', pct_color(89))} "
+          f"{dim('↻Mon 5pm')}"
+          f"{_sep()}{tc('Ctx 45%↑', C_LOW)}"
+          f"{_sep()}{tc('$2.71', C_TEXT)}"
+          f"{_sep()}{tc('opus-4.6', C_CYAN)} {tc('H', C_DIM)}"
+          f"{_sep()}{tc('⚡Peak', C_PEAK)}"
+          f"{_sep()}{tc('main', C_TEXT)}{dim('*2')}")
+
+
+def usage() -> None:
+    print(f"""{BOLD}claude-statusline v{VERSION}{RST} — glanceable intelligence for your terminal
+
+{BOLD}Setup:{RST}
+  statusline.py --install          Add to Claude Code settings
+  statusline.py --demo             Preview the status bar
+
+{BOLD}Configure:{RST}
+  statusline.py --config           Show current settings
+  statusline.py --currency <sym>   Set currency ($, £, €, ¥, ₹, kr, etc.)
+  statusline.py --bar-width <n>    4-20 or small/medium/large/xl
+  statusline.py --show <widget>    Enable a widget
+  statusline.py --hide <widget>    Disable a widget
+  statusline.py --peak-hours <v>   HH:MM-HH:MM | on | off
+  statusline.py --reset            Factory reset
+
+{BOLD}Widgets:{RST}
+  session, weekly, context, cost, model, git, effort,
+  peak, burn_rate, runway_alert, reset_timer, context_velocity""")
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args = sys.argv[1:]
+
+    if args:
+        cmd = args[0]
+        arg = args[1] if len(args) > 1 else None
+        dispatch = {
+            "--help": lambda: usage(),
+            "-h": lambda: usage(),
+            "--version": lambda: print(f"claude-statusline v{VERSION}"),
+            "--install": lambda: cli_install(),
+            "--config": lambda: cli_config(),
+            "--demo": lambda: cli_demo(),
+            "--reset": lambda: (save_config(json.loads(json.dumps(DEFAULT_CONFIG))),
+                                print("Reset to defaults.")),
+        }
+        if cmd in dispatch:
+            dispatch[cmd]()
+            return
+        if cmd == "--currency" and arg:
+            cli_currency(arg); return
+        if cmd == "--bar-width" and arg:
+            cli_bar_width(arg); return
+        if cmd in ("--show", "--hide") and arg:
+            cli_toggle(cmd[2:], arg); return
+        if cmd == "--peak-hours" and arg:
+            cli_peak(arg); return
+
+        print(f"Unknown: {cmd}")
+        usage()
+        sys.exit(1)
+
+    # ── Normal operation: render status line ─────────────────────────────────
+    try:
+        cfg = load_config()
+        data = parse_stdin()
+
+        if not data:
+            print(tc("Claude", C_TEXT))
+            return
+
+        hist = load_history()
+        hist = record_history(hist, data["session_pct"], data["weekly_pct"], data["ctx_pct"])
+
+        print(render(data, cfg, hist))
+    except Exception:
+        print("Claude")
+
+
+if __name__ == "__main__":
+    main()
