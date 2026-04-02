@@ -955,6 +955,122 @@ def cli_demo() -> None:
           f"{_sep()}{tc('main', C_TEXT)}{dim('*5')}")
 
 
+def cli_status() -> None:
+    """Full system dashboard: config, hooks, plugins, agents, skills, journal."""
+    cfg = load_config()
+    settings_path = Path.home() / ".claude" / "settings.json"
+
+    print(f"\n{BOLD}claude-statusline v{VERSION} — system status{RST}\n")
+
+    # ── Statusline ──
+    print(f"  {BOLD}Statusline{RST}")
+    print(f"    Palette:    {render_bar(20, 4)} {render_bar(50, 4)} {render_bar(80, 4)}")
+    print(f"    Currency:   {cfg.get('currency', '$')}")
+    print(f"    Bar width:  {cfg.get('bar_width', 10)}")
+    ph = cfg.get("peak_hours", {})
+    print(f"    Peak hours: {ph.get('start', '13:00')}-{ph.get('end', '19:00')}" if ph.get("enabled") else "    Peak hours: off")
+
+    # ── Hooks ──
+    try:
+        settings = json.loads(settings_path.read_text())
+    except Exception:
+        settings = {}
+
+    hooks = settings.get("hooks", {})
+    print(f"\n  {BOLD}Hooks{RST} ({len(hooks)} events)")
+    for event, entries in hooks.items():
+        count = sum(len(e.get("hooks", [])) for e in entries)
+        has_sl = any("statusline" in str(h) for e in entries for h in e.get("hooks", []))
+        marker = f" {tc('◀ statusline', C_CYAN)}" if has_sl else ""
+        print(f"    {event:<20} {count} hook{'s' if count != 1 else ''}{marker}")
+
+    # ── Plugins ──
+    plugins = settings.get("enabledPlugins", {})
+    active = [k.split("@")[0] for k, v in plugins.items() if v]
+    print(f"\n  {BOLD}Plugins{RST} ({len(active)} active)")
+    for p in active:
+        print(f"    {tc(p, C_TEXT)}")
+
+    # ── MCP Servers ──
+    mcp = settings.get("mcpServers", {})
+    if mcp:
+        print(f"\n  {BOLD}MCP Servers{RST} ({len(mcp)})")
+        for name in sorted(mcp.keys()):
+            print(f"    {tc(name, C_TEXT)}")
+
+    # ── Agents (built-in) ──
+    agents = [
+        ("Explore", "Fast codebase exploration"),
+        ("Plan", "Architecture and implementation planning"),
+        ("research-synthesizer", "Multi-source research synthesis"),
+        ("dd-analyst", "Due diligence on companies/markets"),
+        ("security-reviewer", "Code security audits"),
+        ("code-auditor", "Deep code review, trace execution paths"),
+        ("eval-runner", "Design and run LLM evaluations"),
+        ("team-orchestrator", "Multi-agent team coordination"),
+        ("writing-editor", "Sharpen memos, theses, documents"),
+        ("code-simplifier", "Simplify and refine code"),
+        ("claude-code-guide", "Questions about Claude Code"),
+    ]
+    print(f"\n  {BOLD}Agents{RST} ({len(agents)} types)")
+    for name, desc in agents:
+        print(f"    {tc(name, C_CYAN):<38} {dim(desc)}")
+
+    # ── Skills ──
+    skills = [
+        ("/pulse", "Configure status bar"),
+        ("/reason", "Deep reasoning via Codex"),
+        ("/plan", "Implementation plan via Codex"),
+        ("/spec", "Technical spec via Codex"),
+        ("/codex", "Custom Codex task"),
+        ("/simplify", "Review code for quality"),
+        ("/loop", "Recurring interval commands"),
+        ("/schedule", "Cron-scheduled remote agents"),
+        ("/claude-api", "Build with Anthropic SDK"),
+        ("/llm-evals", "Build LLM evaluations"),
+        ("/optimize-anything", "Iterative GEPA optimization"),
+        ("/deep-dd", "Due diligence and company evaluation"),
+        ("/research-synthesis", "Deep research and synthesis"),
+        ("/memo-writer", "Investment memos and analysis"),
+        ("/codebase-onboard", "Explore and understand codebases"),
+        ("/claude-md-management:revise-claude-md", "Update CLAUDE.md"),
+        ("/claude-md-management:claude-md-improver", "Audit CLAUDE.md files"),
+        ("/ralph-loop:ralph-loop", "Start Ralph Loop"),
+    ]
+    print(f"\n  {BOLD}Skills{RST} ({len(skills)} available)")
+    for name, desc in skills:
+        print(f"    {tc(name, C_PEAK):<45} {dim(desc)}")
+
+    # ── Journal ──
+    print(f"\n  {BOLD}Journal{RST}")
+    if JOURNAL_FILE.exists():
+        lines = [l for l in JOURNAL_FILE.read_text().strip().split("\n") if l.strip()]
+        total_cost = 0
+        total_lines = 0
+        total_tools = 0
+        for line in lines:
+            try:
+                e = json.loads(line)
+                total_cost += e.get("cost", 0)
+                total_lines += e.get("lines_added", 0)
+                total_tools += e.get("tools", 0)
+            except Exception:
+                continue
+        print(f"    {len(lines)} sessions recorded")
+        print(f"    ${total_cost:.2f} total cost   +{total_lines} lines   {total_tools} tools")
+    else:
+        print(f"    No data yet. Run {BOLD}--install-hooks{RST} to start recording.")
+
+    # ── Telemetry ──
+    telem = read_json(TELEMETRY_FILE)
+    if telem and telem.get("tool_count"):
+        elapsed = (time.time() - telem.get("session_start", time.time())) / 60
+        print(f"\n  {BOLD}Current session{RST}")
+        print(f"    {telem['tool_count']} tools   {elapsed:.0f}m elapsed   last: {telem.get('last_tool', '?')}")
+
+    print()
+
+
 def usage() -> None:
     print(f"""{BOLD}claude-statusline v{VERSION}{RST} — glanceable intelligence for your terminal
 
@@ -1239,6 +1355,7 @@ def main() -> None:
             "--install-hooks": lambda: cli_install_hooks(),
             "--config": lambda: cli_config(),
             "--demo": lambda: cli_demo(),
+            "--status": lambda: cli_status(),
             "--stats": lambda: cli_stats(),
             "--hook-stop": lambda: cli_hook_stop(),
             "--hook-tool": lambda: cli_hook_tool(),
