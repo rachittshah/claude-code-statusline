@@ -216,6 +216,7 @@ def parse_stdin() -> dict:
         return {}
 
     ctx_pct = _get(data, "context_window.used_percentage", 0) or 0
+    ctx_remaining = _get(data, "context_window.remaining_percentage", None)
     tokens_used = _get(data, "context_window.tokens_used", 0) or 0
     token_limit = _get(data, "context_window.token_limit", 0) or 0
 
@@ -223,16 +224,30 @@ def parse_stdin() -> dict:
     if ctx_pct == 0 and token_limit > 0:
         ctx_pct = round(tokens_used / token_limit * 100, 1)
 
+    # Handle both field names (used_percentage / percentage_used)
+    def _rate(window: str):
+        rl = _get(data, f"rate_limits.{window}", {}) or {}
+        pct = rl.get("used_percentage") or rl.get("percentage_used") or 0
+        resets = rl.get("resets_at", "")
+        # Normalize: if resets_at is a Unix timestamp (number), convert to ISO
+        if isinstance(resets, (int, float)) and resets > 1_000_000_000:
+            resets = datetime.fromtimestamp(resets, tz=timezone.utc).isoformat()
+        return float(pct), str(resets) if resets else ""
+
+    s_pct, s_resets = _rate("five_hour")
+    w_pct, w_resets = _rate("seven_day")
+
     return {
         "model": _get(data, "model.display_name", ""),
         "ctx_pct": ctx_pct,
+        "ctx_remaining": ctx_remaining,
         "tokens_used": tokens_used,
         "token_limit": token_limit,
         "cost_usd": _get(data, "cost.total_cost_usd", 0) or 0,
-        "session_pct": _get(data, "rate_limits.five_hour.percentage_used", 0) or 0,
-        "session_resets": _get(data, "rate_limits.five_hour.resets_at", ""),
-        "weekly_pct": _get(data, "rate_limits.seven_day.percentage_used", 0) or 0,
-        "weekly_resets": _get(data, "rate_limits.seven_day.resets_at", ""),
+        "session_pct": s_pct,
+        "session_resets": s_resets,
+        "weekly_pct": w_pct,
+        "weekly_resets": w_resets,
         "cwd": _get(data, "workspace.current_dir", ""),
         "git_branch": _get(data, "workspace.git_branch", ""),
         "vim_mode": _get(data, "vim.mode", ""),
@@ -864,6 +879,11 @@ def main() -> None:
 
         if not data:
             print(tc("Claude", C_TEXT))
+            return
+
+        # Yield when context <= 20% remaining — Claude Code's built-in bar takes over
+        ctx_rem = data.get("ctx_remaining")
+        if ctx_rem is not None and ctx_rem <= 20:
             return
 
         hist = load_history()
