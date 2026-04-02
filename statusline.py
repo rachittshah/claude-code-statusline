@@ -14,12 +14,12 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ─── Constants ───────────────────────────────────────────────────────────────────
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 CONFIG_DIR = Path.home() / ".config" / "claude-statusline"
 CACHE_DIR = Path.home() / ".cache" / "claude-statusline"
@@ -27,6 +27,9 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CACHE_DIR / "history.json"
 GIT_CACHE_FILE = CACHE_DIR / "git_cache.json"
 FX_CACHE_FILE = CACHE_DIR / "fx_cache.json"
+JOURNAL_FILE = CACHE_DIR / "journal.jsonl"
+SESSION_STATE_FILE = CACHE_DIR / "session.json"
+TELEMETRY_FILE = CACHE_DIR / "telemetry.json"
 
 # Unicode sub-character blocks for bar precision (9 levels: empty through full)
 BLOCKS = " ▏▎▍▌▋▊▉█"
@@ -148,6 +151,7 @@ DEFAULT_CONFIG = {
         "peak": True,
         "lines": True,
         "duration": True,
+        "telemetry": True,
         "burn_rate": True,
         "runway_alert": True,
         "reset_timer": True,
@@ -719,6 +723,46 @@ def w_peak(data: dict, cfg: dict) -> str | None:
     return None
 
 
+def w_telemetry(data: dict, cfg: dict) -> str | None:
+    """Live tool counter from PostToolUse hook."""
+    telem = read_json(TELEMETRY_FILE)
+    if not telem or not telem.get("tool_count"):
+        return None
+
+    count = telem["tool_count"]
+    elapsed_min = (time.time() - telem.get("session_start", time.time())) / 60
+
+    if elapsed_min > 1 and count > 5:
+        vel = count / elapsed_min
+        return tc(f"⚡{count} tools", C_PEAK) + " " + dim(f"{vel:.0f}/m")
+
+    return tc(f"⚡{count} tools", C_PEAK)
+
+
+# ─── Session State (tracks peaks across renders) ────────────────────────────────
+
+def update_session_state(data: dict) -> None:
+    """Update running session state on every render. The Stop hook reads this."""
+    state = read_json(SESSION_STATE_FILE) or {}
+
+    now = time.time()
+    if "start_ts" not in state:
+        state["start_ts"] = now
+
+    state["last_ts"] = now
+    state["cost"] = data.get("cost_usd", 0)
+    state["lines_added"] = data.get("lines_added", 0)
+    state["lines_removed"] = data.get("lines_removed", 0)
+    state["model"] = data.get("model", "")
+    state["ctx_peak"] = max(state.get("ctx_peak", 0), data.get("ctx_pct", 0))
+
+    cwd = data.get("cwd", "")
+    if cwd:
+        state["repo"] = os.path.basename(cwd)
+
+    write_json(SESSION_STATE_FILE, state)
+
+
 # ─── Layout ──────────────────────────────────────────────────────────────────────
 
 def terminal_width() -> int:
@@ -748,10 +792,11 @@ def render(data: dict, cfg: dict, hist: list) -> str:
         ("context",  lambda: w_context(data, cfg, hist)),
         ("cost",     lambda: w_cost(data, cfg)),
         ("model",    lambda: w_model(data, cfg)),
-        ("lines",    lambda: w_lines(data, cfg)),
-        ("duration", lambda: w_duration(data, cfg)),
-        ("peak",     lambda: w_peak(data, cfg)),
-        ("git",      lambda: w_git(data, cfg)),
+        ("lines",     lambda: w_lines(data, cfg)),
+        ("telemetry", lambda: w_telemetry(data, cfg)),
+        ("duration",  lambda: w_duration(data, cfg)),
+        ("peak",      lambda: w_peak(data, cfg)),
+        ("git",       lambda: w_git(data, cfg)),
     ]
     widgets = []
     for name, builder in widget_specs:
@@ -926,9 +971,256 @@ def usage() -> None:
   statusline.py --peak-hours <v>   HH:MM-HH:MM | on | off
   statusline.py --reset            Factory reset
 
+{BOLD}Analytics:{RST}
+  statusline.py --stats            Session analytics (cost, lines, repos)
+  statusline.py --install-hooks    Install Stop + PostToolUse hooks
+
 {BOLD}Widgets:{RST}
-  session, weekly, context, cost, model, git, effort,
-  peak, burn_rate, runway_alert, reset_timer, context_velocity""")
+  session, weekly, context, cost, model, git, effort, lines,
+  telemetry, duration, peak, burn_rate, runway_alert, context_velocity""")
+
+
+# ─── Act 1: Session Journal ─────────────────────────────────────────────────────
+
+def cli_hook_stop() -> None:
+    """Called by Stop hook. Records session summary to journal."""
+    # Read latest data from Stop hook stdin
+    stop_cost = stop_lines_add = stop_lines_rem = stop_duration = 0
+    try:
+        raw = sys.stdin.read()
+        if raw.strip():
+            hook_data = json.loads(raw)
+            stop_cost = _get(hook_data, "cost.total_cost_usd", 0) or 0
+            stop_lines_add = _get(hook_data, "cost.total_lines_added", 0) or 0
+            stop_lines_rem = _get(hook_data, "cost.total_lines_removed", 0) or 0
+            stop_duration = _get(hook_data, "cost.total_duration_ms", 0) or 0
+    except Exception:
+        pass
+
+    state = read_json(SESSION_STATE_FILE) or {}
+    telem = read_json(TELEMETRY_FILE) or {}
+
+    # Merge: prefer hook data (freshest) over cached state
+    cost = stop_cost or state.get("cost", 0)
+    lines_added = stop_lines_add or state.get("lines_added", 0)
+    lines_removed = stop_lines_rem or state.get("lines_removed", 0)
+    duration_s = (stop_duration / 1000) if stop_duration else (
+        state.get("last_ts", time.time()) - state.get("start_ts", time.time())
+    )
+
+    # Skip empty sessions
+    if cost == 0 and lines_added == 0 and telem.get("tool_count", 0) == 0:
+        for f in (SESSION_STATE_FILE, TELEMETRY_FILE):
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return
+
+    start_ts = state.get("start_ts", time.time())
+    entry = {
+        "ts": start_ts,
+        "date": datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d"),
+        "repo": state.get("repo", "unknown"),
+        "model": state.get("model", ""),
+        "cost": round(cost, 4),
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "duration_s": round(duration_s),
+        "ctx_peak": round(state.get("ctx_peak", 0), 1),
+        "tools": telem.get("tool_count", 0),
+    }
+
+    _ensure_cache()
+    with open(JOURNAL_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    # Clear session state
+    for f in (SESSION_STATE_FILE, TELEMETRY_FILE):
+        try:
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ─── Act 3: Live Telemetry ──────────────────────────────────────────────────────
+
+def cli_hook_tool() -> None:
+    """Called by PostToolUse hook. Increments tool counter."""
+    telem = read_json(TELEMETRY_FILE) or {}
+
+    now = time.time()
+    if "session_start" not in telem:
+        telem["session_start"] = now
+
+    telem["tool_count"] = telem.get("tool_count", 0) + 1
+    telem["last_tool_ts"] = now
+
+    # Try to read tool name from hook stdin
+    try:
+        raw = sys.stdin.read()
+        if raw.strip():
+            hook_data = json.loads(raw)
+            tool_name = (
+                hook_data.get("tool_name", "")
+                or _get(hook_data, "tool.name", "")
+                or ""
+            )
+            if tool_name:
+                telem["last_tool"] = tool_name[:20]
+    except Exception:
+        pass
+
+    write_json(TELEMETRY_FILE, telem)
+
+
+# ─── Act 2: Analytics ───────────────────────────────────────────────────────────
+
+def cli_stats() -> None:
+    """Show session analytics from the journal."""
+    if not JOURNAL_FILE.exists():
+        print("No session data yet. Install hooks first:")
+        print(f"  {sys.executable} {Path(__file__).resolve()} --install-hooks")
+        return
+
+    entries = []
+    for line in JOURNAL_FILE.read_text().strip().split("\n"):
+        if line.strip():
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+
+    if not entries:
+        print("No session data yet.")
+        return
+
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    def _sum(items):
+        return {
+            "n": len(items),
+            "cost": sum(e.get("cost", 0) for e in items),
+            "lines": sum(e.get("lines_added", 0) for e in items),
+            "lines_rm": sum(e.get("lines_removed", 0) for e in items),
+            "hours": sum(e.get("duration_s", 0) for e in items) / 3600,
+            "tools": sum(e.get("tools", 0) for e in items),
+        }
+
+    s_today = _sum([e for e in entries if e.get("date") == today_str])
+    s_week = _sum([e for e in entries if e.get("date", "") >= week_ago])
+    s_all = _sum(entries)
+
+    def _lines(n):
+        return f"+{n / 1000:.1f}K" if n >= 1000 else f"+{n}"
+
+    def _hrs(h):
+        return f"{h:.1f}h" if h >= 1 else f"{h * 60:.0f}m"
+
+    def _cost(c):
+        return f"${c:,.0f}" if c >= 1000 else f"${c:.2f}"
+
+    print(f"\n{BOLD}claude-statusline — session analytics{RST}\n")
+
+    for label, s in [("Today", s_today), ("This week", s_week), ("All time", s_all)]:
+        if s["n"] == 0:
+            continue
+        print(
+            f"  {tc(label, C_TEXT):<28} "
+            f"{s['n']:>3} sessions   "
+            f"{_cost(s['cost']):>8}   "
+            f"{_lines(s['lines']):>8} lines   "
+            f"{_hrs(s['hours']):>6}   "
+            f"{s['tools']:>5} tools"
+        )
+
+    # Cost by repo
+    repos = {}
+    for e in entries:
+        repo = e.get("repo", "unknown")
+        r = repos.setdefault(repo, {"n": 0, "cost": 0, "lines": 0, "tools": 0})
+        r["n"] += 1
+        r["cost"] += e.get("cost", 0)
+        r["lines"] += e.get("lines_added", 0)
+        r["tools"] += e.get("tools", 0)
+
+    sorted_repos = sorted(repos.items(), key=lambda x: x[1]["cost"], reverse=True)
+    max_cost = sorted_repos[0][1]["cost"] if sorted_repos else 1
+
+    if sorted_repos:
+        print(f"\n  {BOLD}Cost by repo{RST}")
+        for repo, d in sorted_repos[:10]:
+            pct = d["cost"] / max_cost * 100 if max_cost > 0 else 0
+            bar = render_bar(pct, 20)
+            print(
+                f"    {repo:<18} {bar}  "
+                f"{d['n']:>3} sessions  "
+                f"{_cost(d['cost']):>8}  "
+                f"{_lines(d['lines']):>8}  "
+                f"{d['tools']:>5} tools"
+            )
+
+    # Efficiency metrics
+    print()
+    parts = []
+    if s_all["lines"] > 0 and s_all["cost"] > 0:
+        parts.append(f"Cost/line: ${s_all['cost'] / s_all['lines']:.3f}")
+    if s_all["n"] > 0:
+        avg_min = s_all["hours"] * 60 / s_all["n"]
+        parts.append(f"Avg session: {avg_min:.0f}m")
+    if s_all["tools"] > 0 and s_all["n"] > 0:
+        parts.append(f"Avg tools: {s_all['tools'] // s_all['n']}/session")
+    if s_all["lines"] > 0 and s_all["tools"] > 0:
+        parts.append(f"Tools/line: {s_all['tools'] / s_all['lines']:.2f}")
+    if parts:
+        print(f"  {dim(' │ '.join(parts))}")
+    print()
+
+
+def cli_install_hooks() -> None:
+    """Install Stop + PostToolUse hooks into Claude Code settings."""
+    script = str(Path(__file__).resolve())
+    python = sys.executable
+
+    settings_path = Path.home() / ".claude" / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text())
+    except Exception:
+        print(f"Error: Cannot read {settings_path}")
+        sys.exit(1)
+
+    hooks = settings.setdefault("hooks", {})
+
+    stop_cmd = f'{python} "{script}" --hook-stop'
+    tool_cmd = f'{python} "{script}" --hook-tool'
+
+    def _has_cmd(hook_list, cmd):
+        return any(
+            cmd in str(h.get("command", ""))
+            for entry in hook_list
+            for h in entry.get("hooks", [])
+        )
+
+    # Stop hook → session journal
+    stop_list = hooks.setdefault("Stop", [])
+    if not _has_cmd(stop_list, "statusline"):
+        stop_list.append({"hooks": [{"type": "command", "command": stop_cmd}]})
+
+    # PostToolUse hook → telemetry
+    tool_list = hooks.setdefault("PostToolUse", [])
+    if not _has_cmd(tool_list, "statusline"):
+        tool_list.append({"hooks": [{"type": "command", "command": tool_cmd}]})
+
+    tmp = settings_path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    tmp.replace(settings_path)
+
+    print(f"{BOLD}Hooks installed.{RST}")
+    print("  Stop hook:        → session journal (records every session)")
+    print("  PostToolUse hook: → live telemetry (⚡tool counter in status bar)")
+    print("\nRestart Claude Code to activate.")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────────
@@ -944,8 +1236,12 @@ def main() -> None:
             "-h": lambda: usage(),
             "--version": lambda: print(f"claude-statusline v{VERSION}"),
             "--install": lambda: cli_install(),
+            "--install-hooks": lambda: cli_install_hooks(),
             "--config": lambda: cli_config(),
             "--demo": lambda: cli_demo(),
+            "--stats": lambda: cli_stats(),
+            "--hook-stop": lambda: cli_hook_stop(),
+            "--hook-tool": lambda: cli_hook_tool(),
             "--reset": lambda: (save_config(json.loads(json.dumps(DEFAULT_CONFIG))),
                                 print("Reset to defaults.")),
         }
@@ -992,6 +1288,9 @@ def main() -> None:
 
         hist = load_history()
         hist = record_history(hist, data["session_pct"], data["weekly_pct"], data["ctx_pct"])
+
+        # Track session state for the journal
+        update_session_state(data)
 
         print(render(data, cfg, hist))
     except Exception:
