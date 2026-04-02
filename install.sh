@@ -43,26 +43,33 @@ PYTHON_PATH="$(command -v "$PYTHON")"
 SETTINGS="$HOME/.claude/settings.json"
 COMMAND="$PYTHON_PATH \"$SCRIPT\""
 
+export _SL_SETTINGS="$SETTINGS"
+export _SL_COMMAND="$COMMAND"
+
 if [ -f "$SETTINGS" ]; then
     if grep -q "statusline.py" "$SETTINGS" 2>/dev/null; then
         echo "Already configured in $SETTINGS"
         echo "Updating command path..."
     fi
     "$PYTHON" -c "
-import json, sys
-with open('$SETTINGS') as f:
+import json, os, sys
+settings_path = os.environ['_SL_SETTINGS']
+command = os.environ['_SL_COMMAND']
+with open(settings_path) as f:
     cfg = json.load(f)
-cfg['statusLine'] = {'type': 'command', 'command': '$COMMAND'}
-with open('$SETTINGS', 'w') as f:
+cfg['statusLine'] = {'type': 'command', 'command': command}
+with open(settings_path, 'w') as f:
     json.dump(cfg, f, indent=2)
     f.write('\n')
 "
 else
     mkdir -p "$(dirname "$SETTINGS")"
     "$PYTHON" -c "
-import json
-cfg = {'statusLine': {'type': 'command', 'command': '$COMMAND'}}
-with open('$SETTINGS', 'w') as f:
+import json, os
+settings_path = os.environ['_SL_SETTINGS']
+command = os.environ['_SL_COMMAND']
+cfg = {'statusLine': {'type': 'command', 'command': command}}
+with open(settings_path, 'w') as f:
     json.dump(cfg, f, indent=2)
     f.write('\n')
 "

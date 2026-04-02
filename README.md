@@ -46,14 +46,14 @@ The runway alert only appears when you're on track to hit rate limits before the
 ## Configure
 
 ```bash
-python3 ~/.claude-statusline/statusline.py --config           # Show settings
-python3 ~/.claude-statusline/statusline.py --demo             # Preview the bar
-python3 ~/.claude-statusline/statusline.py --currency £        # Set currency
-python3 ~/.claude-statusline/statusline.py --bar-width large   # Bar width (small/medium/large/xl or 4-20)
-python3 ~/.claude-statusline/statusline.py --show burn_rate    # Enable a widget
-python3 ~/.claude-statusline/statusline.py --hide peak         # Disable a widget
-python3 ~/.claude-statusline/statusline.py --peak-hours 13:00-19:00  # Set peak window
-python3 ~/.claude-statusline/statusline.py --reset             # Factory reset
+~/.claude-statusline/statusline.py --config           # Show settings
+~/.claude-statusline/statusline.py --demo             # Preview the bar
+~/.claude-statusline/statusline.py --currency £        # Set currency
+~/.claude-statusline/statusline.py --bar-width large   # Bar width (small/medium/large/xl or 4-20)
+~/.claude-statusline/statusline.py --show burn_rate    # Enable a widget
+~/.claude-statusline/statusline.py --hide peak         # Disable a widget
+~/.claude-statusline/statusline.py --peak-hours 13:00-19:00  # Set peak window
+~/.claude-statusline/statusline.py --reset             # Factory reset
 ```
 
 ### Widgets you can show/hide

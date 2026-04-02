@@ -169,7 +169,7 @@ def load_config() -> dict:
 
 def save_config(config: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp = CONFIG_FILE.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(config, indent=2) + "\n")
     tmp.replace(CONFIG_FILE)
 
@@ -189,7 +189,7 @@ def read_json(path: Path):
 
 def write_json(path: Path, data) -> None:
     _ensure_cache()
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data))
     tmp.replace(path)
 
@@ -274,6 +274,13 @@ def record_history(history: list, s_pct: float, w_pct: float, c_pct: float) -> l
     if history and now - history[-1]["t"] < HISTORY_MIN_INTERVAL:
         return history
 
+    # Detect usage reset: if session or weekly dropped by >20%, clear history
+    # so burn rate doesn't go negative from stale pre-reset samples
+    if history:
+        last = history[-1]
+        if (last.get("s", 0) - s_pct > 20) or (last.get("w", 0) - w_pct > 20):
+            history = []
+
     history.append({"t": now, "s": round(s_pct, 1), "w": round(w_pct, 1), "c": round(c_pct, 1)})
 
     # Prune
@@ -330,10 +337,14 @@ def ctx_velocity(history: list, window_sec: int = 120) -> float:
 
 
 def velocity_arrows(vel: float) -> str:
-    if vel > 5:   return "↑↑↑"
-    if vel > 2:   return "↑↑"
-    if vel > 0.5: return "↑"
-    if vel < -0.5: return "↓"
+    if vel > 5:
+        return "↑↑↑"
+    if vel > 2:
+        return "↑↑"
+    if vel > 0.5:
+        return "↑"
+    if vel < -0.5:
+        return "↓"
     return ""
 
 
@@ -412,8 +423,13 @@ FALLBACK_FX = {
 
 def _fx_rate(code: str) -> float:
     cache = read_json(FX_CACHE_FILE)
+    cached_rate = cache.get("rates", {}).get(code) if cache else None
+
+    # Serve from cache if fresh
     if cache and time.time() - cache.get("t", 0) < FX_CACHE_TTL:
-        return cache.get("rates", {}).get(code, FALLBACK_FX.get(code, 1))
+        return cached_rate if cached_rate is not None else FALLBACK_FX.get(code, 1)
+
+    # Try refresh, but prefer stale cached rate over blocking on failure
     try:
         import urllib.request
         req = urllib.request.Request(
@@ -425,6 +441,9 @@ def _fx_rate(code: str) -> float:
             write_json(FX_CACHE_FILE, {"t": time.time(), "rates": data.get("rates", {})})
             return data["rates"].get(code, FALLBACK_FX.get(code, 1))
     except Exception:
+        # Prefer stale cache over hardcoded fallback
+        if cached_rate is not None:
+            return cached_rate
         return FALLBACK_FX.get(code, 1)
 
 
@@ -655,28 +674,21 @@ def render(data: dict, cfg: dict, hist: list) -> str:
     show = cfg["show"]
 
     # Build widgets in priority order (most important first)
+    widget_specs = [
+        ("session", lambda: w_session(data, cfg, hist)),
+        ("weekly",  lambda: w_weekly(data, cfg, hist)),
+        ("context", lambda: w_context(data, cfg, hist)),
+        ("cost",    lambda: w_cost(data, cfg)),
+        ("model",   lambda: w_model(data, cfg)),
+        ("peak",    lambda: w_peak(data, cfg)),
+        ("git",     lambda: w_git(data, cfg)),
+    ]
     widgets = []
-    if show.get("session"):
-        w = w_session(data, cfg, hist)
-        if w: widgets.append(w)
-    if show.get("weekly"):
-        w = w_weekly(data, cfg, hist)
-        if w: widgets.append(w)
-    if show.get("context"):
-        w = w_context(data, cfg, hist)
-        if w: widgets.append(w)
-    if show.get("cost"):
-        w = w_cost(data, cfg)
-        if w: widgets.append(w)
-    if show.get("model"):
-        w = w_model(data, cfg)
-        if w: widgets.append(w)
-    if show.get("peak"):
-        w = w_peak(data, cfg)
-        if w: widgets.append(w)
-    if show.get("git"):
-        w = w_git(data, cfg)
-        if w: widgets.append(w)
+    for name, builder in widget_specs:
+        if show.get(name):
+            w = builder()
+            if w:
+                widgets.append(w)
 
     if not widgets:
         return tc("Claude", C_TEXT)
@@ -707,13 +719,14 @@ def cli_install() -> None:
         try:
             settings = json.loads(settings_path.read_text())
         except Exception:
-            settings = {}
+            print(f"Error: {settings_path} contains invalid JSON. Fix it manually first.")
+            sys.exit(1)
     else:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         settings = {}
 
     settings["statusLine"] = {"type": "command", "command": cmd}
-    tmp = settings_path.with_suffix(".tmp")
+    tmp = settings_path.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(settings, indent=2) + "\n")
     tmp.replace(settings_path)
 
@@ -860,13 +873,17 @@ def main() -> None:
             dispatch[cmd]()
             return
         if cmd == "--currency" and arg:
-            cli_currency(arg); return
+            cli_currency(arg)
+            return
         if cmd == "--bar-width" and arg:
-            cli_bar_width(arg); return
+            cli_bar_width(arg)
+            return
         if cmd in ("--show", "--hide") and arg:
-            cli_toggle(cmd[2:], arg); return
+            cli_toggle(cmd[2:], arg)
+            return
         if cmd == "--peak-hours" and arg:
-            cli_peak(arg); return
+            cli_peak(arg)
+            return
 
         print(f"Unknown: {cmd}")
         usage()
