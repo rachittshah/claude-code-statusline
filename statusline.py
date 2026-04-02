@@ -152,6 +152,7 @@ DEFAULT_CONFIG = {
         "lines": True,
         "duration": True,
         "telemetry": True,
+        "harness": True,
         "burn_rate": True,
         "runway_alert": True,
         "reset_timer": True,
@@ -712,6 +713,39 @@ def w_peak(data: dict, cfg: dict) -> str | None:
     return None
 
 
+def w_harness() -> str | None:
+    """Show harness surface: hooks, plugins, skills, agents."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+
+    # Cache this — settings.json doesn't change mid-session
+    cache_key = "harness"
+    cache = read_json(GIT_CACHE_FILE)  # reuse git cache file for simplicity
+    if cache and cache.get(cache_key) and time.time() - cache.get("ht", 0) < 300:
+        h, p = cache[cache_key]
+    else:
+        try:
+            s = json.loads(settings_path.read_text())
+            h = sum(len(e.get("hooks", [])) for entries in s.get("hooks", {}).values() for e in entries)
+            p = sum(1 for v in s.get("enabledPlugins", {}).values() if v)
+        except Exception:
+            h, p = 0, 0
+        # Write to cache
+        c = cache if cache else {}
+        c[cache_key] = [h, p]
+        c["ht"] = time.time()
+        write_json(GIT_CACHE_FILE, c)
+
+    parts = []
+    if h:
+        parts.append(f"{h}H")
+    if p:
+        parts.append(f"{p}P")
+    parts.append("11A")   # agents are built-in, count is stable
+    parts.append("18S")   # skills are built-in, count is stable
+
+    return dim(" ".join(parts))
+
+
 def w_telemetry(data: dict, cfg: dict) -> str | None:
     """Live tool counter from PostToolUse hook. Always shown."""
     telem = read_json(TELEMETRY_FILE)
@@ -786,6 +820,7 @@ def render(data: dict, cfg: dict, hist: list) -> str:
         ("telemetry", lambda: w_telemetry(data, cfg)),
         ("duration",  lambda: w_duration(data, cfg)),
         ("peak",      lambda: w_peak(data, cfg)),
+        ("harness",   lambda: w_harness()),
         ("git",       lambda: w_git(data, cfg)),
     ]
     widgets = []
