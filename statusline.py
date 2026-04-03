@@ -658,9 +658,20 @@ def w_model(data: dict, cfg: dict) -> str | None:
     parts = [tc(display, C_CYAN)]
 
     if cfg["show"].get("effort"):
-        effort = data.get("effort", "")
+        # Try env var first, then settings.json
+        effort = data.get("effort", "") or os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", "")
+        if not effort:
+            try:
+                s = json.loads((Path.home() / ".claude" / "settings.json").read_text())
+                effort = s.get("effortLevel", "")
+                thinking = s.get("alwaysThinkingEnabled", False)
+                if thinking and not effort:
+                    effort = "high"
+            except Exception:
+                pass
         if effort and effort.lower() not in ("", "default"):
-            parts.append(tc(effort[0].upper(), C_DIM))
+            label = {"high": "H", "medium": "M", "low": "L"}.get(effort.lower(), effort[0].upper())
+            parts.append(tc(label, C_DIM))
 
     return " ".join(parts)
 
