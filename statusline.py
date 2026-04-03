@@ -134,11 +134,65 @@ def render_bar(pct: float, width: int = 10) -> str:
     return "".join(parts) + RST
 
 
+def render_race_bar(pct: float, width: int = 10) -> str:
+    """
+    Render a racetrack bar with a car that drives toward the edge.
+
+    The car position = context usage. When you hit 100%, it crashes.
+    This is the Chrome dino game of CLI status bars.
+    """
+    pct = max(0.0, min(100.0, pct))
+    color = pct_color(pct)
+
+    # Car position: 0 at left edge, width-1 at right edge
+    pos = int(pct / 100 * (width - 1))
+    pos = min(pos, width - 1)
+
+    road_behind = "═" * pos
+    road_ahead_len = width - pos - 1
+
+    if pct >= 98:
+        # CRASH — hit the wall
+        car = "💥"
+        road_ahead = ""
+        road_ahead_len = max(0, road_ahead_len - 1)  # emoji takes 2 chars
+        road_ahead = "═" * road_ahead_len if road_ahead_len > 0 else ""
+        return f"{fg(*C_HIGH)}{road_behind}{RST}💥{fg(*C_DIM)}{road_ahead}{RST}"
+    elif pct >= 80:
+        # DANGER — car is red, moving fast
+        car_color = C_HIGH
+        dust = "»"
+    elif pct >= 50:
+        # CAUTION — amber
+        car_color = C_MID
+        dust = "›"
+    else:
+        # CRUISING — green
+        car_color = C_LOW
+        dust = " "
+
+    # Build the track
+    parts = []
+    if pos > 0:
+        if pos > 1 and dust.strip():
+            parts.append(f"{fg(*color)}{road_behind[:-1]}{fg(*C_DIM)}{dust}")
+        else:
+            parts.append(f"{fg(*color)}{road_behind}")
+    parts.append(f"{fg(*car_color)}🏎{RST}")
+    if road_ahead_len > 1:
+        parts.append(f"{fg(*C_DIM)}{'═' * (road_ahead_len - 1)}")  # -1 for emoji width
+    elif road_ahead_len > 0:
+        pass  # emoji eats the space
+
+    return "".join(parts) + RST
+
+
 # ─── Configuration ───────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
     "currency": "$",
     "bar_width": 10,
+    "bar_style": "default",  # "default" or "race"
     "peak_hours": {"enabled": True, "start": "13:00", "end": "19:00"},
     "show": {
         "session": True,
@@ -628,9 +682,14 @@ def w_context(data: dict, cfg: dict, hist: list) -> str | None:
     """Context window: bar + pct + velocity arrows. Always shown."""
     pct = data["ctx_pct"]
     bw = cfg["bar_width"]
-    bar = render_bar(pct, bw)
-    vel_str = ""
+    style = cfg.get("bar_style", "default")
 
+    if style == "race":
+        bar = render_race_bar(pct, bw)
+    else:
+        bar = render_bar(pct, bw)
+
+    vel_str = ""
     if cfg["show"].get("context_velocity") and hist:
         arrows = velocity_arrows(ctx_velocity(hist))
         if arrows:
@@ -944,6 +1003,26 @@ def cli_toggle(action: str, widget: str) -> None:
     cfg["show"][widget] = action == "show"
     save_config(cfg)
     print(f"Widget '{widget}' {'shown' if action == 'show' else 'hidden'}")
+
+
+def cli_bar_style(val: str) -> None:
+    """Switch between default and race bar styles."""
+    valid = ("default", "race")
+    if val.lower() not in valid:
+        print(f"Use: {', '.join(valid)}")
+        sys.exit(1)
+    cfg = load_config()
+    cfg["bar_style"] = val.lower()
+    save_config(cfg)
+    bw = cfg["bar_width"]
+    if val.lower() == "race":
+        print(f"Bar style: {BOLD}race{RST} 🏎")
+        for pct in (10, 40, 70, 95, 100):
+            print(f"  {pct:>3}%  {render_race_bar(pct, bw)}")
+    else:
+        print(f"Bar style: {BOLD}default{RST}")
+        for pct in (10, 40, 70, 95, 100):
+            print(f"  {pct:>3}%  {render_bar(pct, bw)}")
 
 
 def cli_peak(val: str) -> None:
@@ -1409,6 +1488,9 @@ def main() -> None:
             return
         if cmd in ("--show", "--hide") and arg:
             cli_toggle(cmd[2:], arg)
+            return
+        if cmd == "--bar-style" and arg:
+            cli_bar_style(arg)
             return
         if cmd == "--peak-hours" and arg:
             cli_peak(arg)
